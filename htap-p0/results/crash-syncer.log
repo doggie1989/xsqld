@@ -1,0 +1,16 @@
+syncer start watermark=0
+METRICS {"sqlite_count": 5066010, "duckdb_count": 5066010, "sqlite_sum": 53907681526, "duckdb_sum": 53907681526, "drift": false, "watermark": 5000, "applied": 5000, "pending": 63010, "lag_s": 555.952}
+METRICS {"sqlite_count": 5066010, "duckdb_count": 5066010, "sqlite_sum": 53907681526, "duckdb_sum": 53907681526, "drift": false, "watermark": 10000, "applied": 10000, "pending": 58010, "lag_s": 557.499}
+METRICS {"sqlite_count": 5066010, "duckdb_count": 5066010, "sqlite_sum": 53907681526, "duckdb_sum": 53907681526, "drift": false, "watermark": 15000, "applied": 15000, "pending": 53010, "lag_s": 558.922}
+METRICS {"sqlite_count": 5066010, "duckdb_count": 5066010, "sqlite_sum": 53907681526, "duckdb_sum": 53907681526, "drift": false, "watermark": 20000, "applied": 20000, "pending": 48010, "lag_s": 272.568}
+METRICS {"sqlite_count": 5066010, "duckdb_count": 5066010, "sqlite_sum": 53907681526, "duckdb_sum": 53907681526, "drift": false, "watermark": 25000, "applied": 25000, "pending": 43010, "lag_s": 274.788}
+METRICS {"sqlite_count": 5066010, "duckdb_count": 5066010, "sqlite_sum": 53907681526, "duckdb_sum": 53907681526, "drift": false, "watermark": 30000, "applied": 30000, "pending": 38010, "lag_s": 277.288}
+METRICS {"sqlite_count": 5066010, "duckdb_count": 5066010, "sqlite_sum": 53907681526, "duckdb_sum": 53907681526, "drift": false, "watermark": 35000, "applied": 35000, "pending": 33010, "lag_s": 279.724}
+METRICS {"sqlite_count": 5066010, "duckdb_count": 5066010, "sqlite_sum": 53907681526, "duckdb_sum": 53907681526, "drift": false, "watermark": 40000, "applied": 40000, "pending": 28010, "lag_s": 228.23}
+METRICS {"sqlite_count": 5066010, "duckdb_count": 5066010, "sqlite_sum": 53907681526, "duckdb_sum": 53907681526, "drift": false, "watermark": 45000, "applied": 45000, "pending": 23010, "lag_s": 230.691}
+METRICS {"sqlite_count": 5066010, "duckdb_count": 5066010, "sqlite_sum": 53907681526, "duckdb_sum": 53907681526, "drift": false, "watermark": 50000, "applied": 50000, "pending": 18010, "lag_s": 233.138}
+METRICS {"sqlite_count": 5066010, "duckdb_count": 5066010, "sqlite_sum": 53907681526, "duckdb_sum": 53907681526, "drift": false, "watermark": 55000, "applied": 55000, "pending": 13010, "lag_s": 235.634}
+METRICS {"sqlite_count": 5066010, "duckdb_count": 5066010, "sqlite_sum": 53907681526, "duckdb_sum": 53907681526, "drift": false, "watermark": 60000, "applied": 60000, "pending": 8010, "lag_s": 115.141}
+METRICS {"sqlite_count": 5066010, "duckdb_count": 5066010, "sqlite_sum": 53907681526, "duckdb_sum": 53907681526, "drift": false, "watermark": 65000, "applied": 65000, "pending": 3010, "lag_s": 106.784}
+METRICS {"sqlite_count": 5066010, "duckdb_count": 5066010, "sqlite_sum": 53907681526, "duckdb_sum": 53907681526, "drift": false, "watermark": 68010, "applied": 68010, "pending": 0, "lag_s": 0.0}
+FINAL {"sqlite_count": 5066010, "duckdb_count": 5066010, "sqlite_sum": 53907681526, "duckdb_sum": 53907681526, "drift": false, "watermark": 68010, "applied": 68010, "stopped": true}

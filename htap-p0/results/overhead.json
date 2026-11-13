@@ -1,0 +1,8 @@
+{
+  "with_triggers_ops_s": 1227,
+  "without_triggers_ops_s": 1362,
+  "write_overhead_pct": 9.9,
+  "changelog_rows_per_insert_with": 1.0,
+  "rss_xsqld_mb": 18,
+  "rss_syncer_mb": 90
+}
