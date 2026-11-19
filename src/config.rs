@@ -18,7 +18,7 @@ pub const COMMIT: &str = env!("XSQLD_GIT_COMMIT");
 
 /// Command line flags. Names and defaults of the first group follow sqld, so an existing
 /// `sqld --db-path … --http-listen-addr … --admin-listen-addr … --enable-namespaces` command line works unchanged.
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Debug, Clone, serde::Serialize)]
 #[command(
     name = "xsqld",
     version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("XSQLD_GIT_COMMIT"), ")"),
@@ -34,6 +34,18 @@ pub struct Config {
     /// Admin API (`/v1/namespaces/<ns>/create`, `DELETE /v1/namespaces/<ns>`, `/metrics`)
     #[arg(long, default_value = "127.0.0.1:8081")]
     pub admin_listen_addr: SocketAddr,
+    /// Answer a SELECT from the DuckDB mirror when the two engines provably agree and the mirror is ahead enough
+    /// to be worth it. Off by default; needs a namespace whose mirror already exists (see /v2/analytics).
+    #[arg(long)]
+    pub route_enabled: bool,
+    /// Single-table SELECTs are routed only above this many estimated rows: below it the mirror's fixed cost per
+    /// query outweighs what a columnar scan saves (measured: the mirror is slower on a 178k-row database)
+    #[arg(long, default_value = "200000")]
+    pub route_min_rows: u64,
+    /// Web console (`/ui`): parameters, schema, metrics and a SQL workbench. Off by default, loopback only, and
+    /// guarded by the token printed at startup. The Hrana and admin ports keep refusing browser requests.
+    #[arg(long)]
+    pub ui_listen_addr: Option<SocketAddr>,
     /// Accepted for sqld command line compatibility; namespaces are always on
     #[arg(long, hide = true)]
     pub enable_namespaces: bool,
@@ -187,9 +199,15 @@ pub struct Config {
     /// it is run again on one connection
     #[arg(long, default_value_t = 1_000_000)]
     pub parallel_max_partial_rows: usize,
+    /// DuckDB's managed memory limit per active namespace (not a process RSS limit)
+    #[arg(long, default_value_t = 512)]
+    pub htap_memory_limit_mb: u64,
+    /// How long the HTAP sync worker stays on the shared pool without work before releasing its worker thread
+    #[arg(long, default_value_t = 10_000)]
+    pub htap_worker_idle_ms: u64,
 }
 
-#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Synchronous {
     Off,
     Normal,
@@ -223,6 +241,9 @@ impl Config {
     }
     pub fn checkpoint_idle(&self) -> Duration {
         Duration::from_millis(self.checkpoint_idle_ms)
+    }
+    pub fn htap_worker_idle(&self) -> Duration {
+        Duration::from_millis(self.htap_worker_idle_ms)
     }
     pub fn group_max_exec(&self) -> Duration {
         Duration::from_millis(self.group_max_exec_ms)
@@ -317,6 +338,13 @@ impl Config {
                 anyhow::bail!("refusing to listen on non-loopback address {addr} (pass --allow-non-loopback)");
             }
         }
+        // The console executes SQL and has no authentication beyond its token, so it stays on this machine even
+        // with --allow-non-loopback: that flag is about the client ports.
+        if let Some(addr) = self.ui_listen_addr
+            && !addr.ip().is_loopback()
+        {
+            anyhow::bail!("--ui-listen-addr must be a loopback address, got {addr}");
+        }
         for (flag, value, min, max) in self.numeric_bounds() {
             if !(min..=max).contains(&value) {
                 anyhow::bail!("--{flag} is {value}; it must be between {min} and {max}");
@@ -360,12 +388,13 @@ impl Config {
     /// Every numeric flag with the range it must be in. Upper bounds keep durations from overflowing the clock
     /// (`Instant + Duration` panics), counts within what a semaphore holds, and sizes and SQLite limits in a range
     /// where they still limit something (SQLite ignores a negative limit and keeps its own default)
-    fn numeric_bounds(&self) -> [(&'static str, i128, i128, i128); 37] {
+    fn numeric_bounds(&self) -> [(&'static str, i128, i128, i128); 40] {
         const HOUR_MS: i128 = 3_600_000;
         const GIB: i128 = 1 << 30;
         let n = |v: usize| v as i128;
         let u = |v: u64| v as i128;
         [
+            ("route-min-rows", u(self.route_min_rows), 1000, 1 << 50),
             ("cache-size", self.cache_size as i128, -(1 << 30), 1 << 30),
             ("read-pool-size", n(self.read_pool_size), 1, 1024),
             ("group-max", n(self.group_max), 1, 65_536),
@@ -442,6 +471,8 @@ impl Config {
                 1000,
                 100_000_000,
             ),
+            ("htap-memory-limit-mb", u(self.htap_memory_limit_mb), 16, 1_048_576),
+            ("htap-worker-idle-ms", u(self.htap_worker_idle_ms), 100, HOUR_MS),
         ]
     }
 
@@ -449,6 +480,7 @@ impl Config {
     pub fn for_tests(dir: &std::path::Path) -> Self {
         let mut c = Config::parse_from(["xsqld"]);
         c.db_path = dir.to_path_buf();
+        c.htap_worker_idle_ms = 200;
         c
     }
 }
@@ -553,6 +585,27 @@ mod tests {
     }
 
     #[test]
+    fn htap_settings_have_bounded_defaults_and_test_idle_timeout() {
+        let defaults = Config::parse_from(["xsqld"]);
+        assert_eq!(defaults.htap_memory_limit_mb, 512);
+        assert_eq!(defaults.htap_worker_idle_ms, 10_000);
+        assert_eq!(defaults.htap_worker_idle(), Duration::from_secs(10));
+
+        let configured = Config::parse_from([
+            "xsqld",
+            "--htap-memory-limit-mb",
+            "1024",
+            "--htap-worker-idle-ms",
+            "2500",
+        ]);
+        assert_eq!(configured.htap_memory_limit_mb, 1024);
+        assert_eq!(configured.htap_worker_idle(), Duration::from_millis(2500));
+
+        let tests = Config::for_tests(std::path::Path::new("/tmp"));
+        assert_eq!(tests.htap_worker_idle(), Duration::from_millis(200));
+    }
+
+    #[test]
     fn db_path_defaults_to_sqlds_data_directory() {
         assert_eq!(Config::parse_from(["xsqld"]).db_path, PathBuf::from("data.sqld"));
     }
@@ -617,6 +670,7 @@ mod tests {
                     "db_path",
                     "http_listen_addr",
                     "admin_listen_addr",
+                    "ui_listen_addr",
                     "db_file_template",
                     "allowed_host_suffixes",
                     "synchronous",

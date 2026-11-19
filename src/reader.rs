@@ -17,7 +17,7 @@ use crate::config::Config;
 use crate::conn::Conn;
 use crate::exec::{self, Exec, Results};
 use crate::metrics::DbMetrics;
-use crate::proto::StreamRequest;
+use crate::proto::{StreamRequest, StreamResponse, StreamResult};
 use crate::sql::{self, Begin, Kind};
 
 pub struct Readers {
@@ -33,7 +33,18 @@ pub struct Readers {
     /// Estimated rows of tables (by name) and when they were estimated (split aggregates: whether a table is large)
     sizes: Mutex<std::collections::HashMap<String, (Option<i128>, Instant)>>,
     pub gate: Arc<ReadGate>,
+    /// Routing decisions by statement text, with the schema version they were made at. Only the structural
+    /// decision and its rewrite are cached; freshness and column purity are always checked live, because neither
+    /// is expressed by the schema version.
+    route_cache: Mutex<RouteCache>,
+    /// The mirror of this database, once one exists. Set by `Db` when analytics installs it; the router only ever
+    /// reads it, and never triggers an install.
+    mirror: Mutex<Option<Arc<crate::htap::Htap>>>,
 }
+
+/// Routing decisions by statement text: the structural verdict (or why it was refused) and the schema version
+/// it was made at. Freshness and column purity are never cached.
+type RouteCache = std::collections::HashMap<String, (Result<crate::route::Routed, &'static str>, Option<i64>)>;
 
 /// How long an estimate of a table's rows is used before it is made again: tables grow slowly, and missing the moment
 /// a table grows past `--parallel-min-rows` by this much only delays splitting
@@ -179,6 +190,8 @@ pub enum ReadOutcome {
 
 impl Readers {
     pub fn new(path: PathBuf, cfg: Arc<Config>, gate: Arc<ReadGate>) -> Self {
+        let mirror = Mutex::new(None);
+        let route_cache = Mutex::new(RouteCache::new());
         let n = cfg.read_pool_size;
         Self {
             path,
@@ -189,6 +202,8 @@ impl Readers {
             sizes: Mutex::new(std::collections::HashMap::new()),
             cfg,
             gate,
+            route_cache,
+            mirror,
         }
     }
 
@@ -202,6 +217,154 @@ impl Readers {
     }
 
     /// Estimated rows of `table`: made by `estimate` at most every [`SIZE_TTL`] per table
+    /// Called by `Db` when the mirror comes up or goes away. The router never installs one itself.
+    pub fn set_mirror(&self, htap: Option<Arc<crate::htap::Htap>>) {
+        *self.mirror.lock() = htap;
+    }
+
+    /// Decides whether this request can be answered by the mirror. Runs under the read gate with a pooled
+    /// connection, because the freshness check and the plan both read SQLite. Returns what to run, so the caller
+    /// can release the gate and the connection before the analytical read begins.
+    fn route_plan(
+        &self,
+        conn: &Conn,
+        requests: &[StreamRequest],
+        deadline: Instant,
+    ) -> Result<(Arc<crate::htap::Htap>, crate::route::Routed, Vec<crate::proto::Value>), crate::metrics::RouteRefused>
+    {
+        if !self.cfg.route_enabled {
+            return Err(crate::metrics::RouteRefused::Shape);
+        }
+        // exactly one SELECT, optionally followed by close: a batch or a transaction stays on SQLite
+        let mut sql: Option<&str> = None;
+        let mut args: Vec<crate::proto::Value> = Vec::new();
+        for request in requests {
+            match request {
+                StreamRequest::Execute { stmt } => {
+                    let text = stmt.sql.as_deref().ok_or(crate::metrics::RouteRefused::Shape)?;
+                    if sql.is_some()
+                        || stmt.sql_id.is_some()
+                        || !stmt.named_args.is_empty()
+                        || sql::classify(text) != sql::Kind::Select
+                    {
+                        return Err(crate::metrics::RouteRefused::Shape);
+                    }
+                    sql = Some(text);
+                    args = stmt.args.clone();
+                }
+                StreamRequest::Close => {}
+                _ => return Err(crate::metrics::RouteRefused::Shape),
+            }
+        }
+        let sql = sql.ok_or(crate::metrics::RouteRefused::Shape)?;
+        let htap = self
+            .mirror
+            .lock()
+            .clone()
+            .ok_or(crate::metrics::RouteRefused::NotReady)?;
+        let snapshot = htap.probe().ok_or(crate::metrics::RouteRefused::NotReady)?;
+        // freshness is checked live, never cached: the mirror must hold every table at or past the source position
+        let target: i64 = conn
+            .c
+            .query_row("SELECT max(pruned_seq,COALESCE((SELECT MAX(seq) FROM xsqld_changelog),0)) FROM xsqld_htap_meta WHERE id=1", [], |r| r.get(0))
+            .map_err(|_| crate::metrics::RouteRefused::NotReady)?;
+        if snapshot.watermark < target {
+            return Err(crate::metrics::RouteRefused::Lagging);
+        }
+        let version: Option<i64> = conn.c.query_row("PRAGMA schema_version", [], |r| r.get(0)).ok();
+        let cached = self.route_cache.lock().get(sql).cloned();
+        let routed = match cached {
+            Some((decision, at)) if at == version => match decision {
+                Ok(routed) => routed,
+                Err(reason) => {
+                    tracing::debug!(sql, reason, "router kept this query on SQLite (cached)");
+                    return Err(crate::metrics::RouteRefused::NotEquivalent);
+                }
+            },
+            _ => {
+                let schema = crate::route::describe(&conn.c, &snapshot.tables.keys().cloned().collect::<Vec<_>>())
+                    .map_err(|_| crate::metrics::RouteRefused::NotReady)?;
+                let decision = crate::route::plan(sql, &schema);
+                let mut cache = self.route_cache.lock();
+                if cache.len() >= UNSPLITTABLE_MAX {
+                    cache.clear();
+                }
+                cache.insert(sql.to_owned(), (decision.clone().map_err(|why| why.label()), version));
+                match decision {
+                    Ok(routed) => routed,
+                    Err(why) => {
+                        tracing::debug!(sql, reason = why.label(), "router kept this query on SQLite");
+                        return Err(crate::metrics::RouteRefused::NotEquivalent);
+                    }
+                }
+            }
+        };
+        // Purity is not part of the schema version: a column that starts holding reals or blobs must stop being
+        // routed even though the schema did not change, so it is checked against the live mirror every time.
+        let purity: std::collections::BTreeMap<String, Vec<String>> = snapshot
+            .tables
+            .iter()
+            .map(|(name, state)| (name.clone(), state.purity.clone()))
+            .collect();
+        if !crate::route::purity_allows(&routed, &purity) {
+            return Err(crate::metrics::RouteRefused::Impure);
+        }
+        for table in &routed.tables {
+            let state = snapshot
+                .tables
+                .get(table)
+                .ok_or(crate::metrics::RouteRefused::NotReady)?;
+            if state.watermark < target {
+                return Err(crate::metrics::RouteRefused::Lagging);
+            }
+        }
+        // benefit gate: an index lookup is cheaper on the row store, and a small scan does not repay the mirror's
+        // fixed cost per query
+        let plan = Self::explain(conn, sql, &args).ok_or(crate::metrics::RouteRefused::Shape)?;
+        let selective = |line: &String| line.contains("SEARCH");
+        // SCAN is a full pass, even when it walks a covering index; SEARCH is a selective lookup, which the row
+        // store wins. The driving access path decides, so a join's inner primary-key lookups are not held against
+        // it — they are exactly what should happen.
+        let driving = plan.first().ok_or(crate::metrics::RouteRefused::Shape)?;
+        if !driving.contains("SCAN") || selective(driving) {
+            return Err(crate::metrics::RouteRefused::Selective);
+        }
+        if routed.tables.len() < 2 && plan.iter().any(selective) {
+            return Err(crate::metrics::RouteRefused::Selective);
+        }
+        if routed.tables.len() < 2 {
+            let table = &routed.tables[0];
+            let rows = self
+                .table_rows(table, || crate::parallel::estimate_table_rows(&conn.c, table))
+                .ok_or(crate::metrics::RouteRefused::Small)?;
+            if rows < self.cfg.route_min_rows as i128 {
+                return Err(crate::metrics::RouteRefused::Small);
+            }
+        }
+        let _ = deadline;
+        Ok((htap, routed, args))
+    }
+
+    fn explain(conn: &Conn, sql: &str, args: &[crate::proto::Value]) -> Option<Vec<String>> {
+        let mut statement = conn.c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).ok()?;
+        let values: Vec<rusqlite::types::Value> = args
+            .iter()
+            .map(|v| match v {
+                crate::proto::Value::Null => rusqlite::types::Value::Null,
+                crate::proto::Value::Integer(n) => rusqlite::types::Value::Integer(*n),
+                crate::proto::Value::Float(f) => rusqlite::types::Value::Real(*f),
+                crate::proto::Value::Text(s) => rusqlite::types::Value::Text(s.clone()),
+                crate::proto::Value::Blob(b) => rusqlite::types::Value::Blob(b.clone()),
+            })
+            .collect();
+        let mut rows = statement.query(rusqlite::params_from_iter(values.iter())).ok()?;
+        let mut out = Vec::new();
+        while let Ok(Some(row)) = rows.next() {
+            out.push(row.get::<_, String>(3).unwrap_or_default());
+        }
+        Some(out)
+    }
+
     pub fn table_rows(&self, table: &str, estimate: impl FnOnce() -> Option<i128>) -> Option<i128> {
         let key = table.to_ascii_lowercase();
         if let Some((n, at)) = self.sizes.lock().get(&key)
@@ -270,6 +433,56 @@ impl Readers {
         let this = self.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            // Routing is decided under the gate (it reads SQLite) but executed outside it, so a long analytical
+            // read cannot hold up a checkpoint. With routing off this branch is skipped and the path is unchanged.
+            if this.cfg.route_enabled {
+                let planned = {
+                    let Some(pass) = this.gate.enter(deadline) else {
+                        return Ok(ReadOutcome::Deadline);
+                    };
+                    let conn = match this.idle.lock().pop() {
+                        Some(c) => c,
+                        None => Conn::open_reader(&this.path, &this.cfg)?,
+                    };
+                    let planned = this.route_plan(&conn, &requests, deadline);
+                    this.idle.lock().push(conn);
+                    drop(pass);
+                    planned
+                };
+                if let Err(why) = &planned {
+                    this.gate.metrics.route_refused[why.index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Ok((htap, routed, args)) = planned
+                    && let Ok(mut result) = htap.run_routed(&routed.sql, args, deadline)
+                    && result.cols.len() == routed.decltypes.len()
+                {
+                    // SQLite reports the source column's declared type; the mirror has none, so supply it here
+                    for (col, declared) in result.cols.iter_mut().zip(&routed.decltypes) {
+                        col.decltype = declared.clone();
+                    }
+                    this.gate
+                        .metrics
+                        .route_runs
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let mut results = Vec::with_capacity(requests.len());
+                    let mut closed = false;
+                    for request in &requests {
+                        match request {
+                            StreamRequest::Close => {
+                                closed = true;
+                                results.push(StreamResult::Ok {
+                                    response: StreamResponse::Close,
+                                });
+                            }
+                            _ => results.push(StreamResult::Ok {
+                                response: StreamResponse::Execute { result: result.clone() },
+                            }),
+                        }
+                    }
+                    return Ok(ReadOutcome::Done { results, closed });
+                }
+                // any refusal or mirror failure falls through: SQLite answers, and its error is the authoritative one
+            }
             let Some(_pass) = this.gate.enter(deadline) else {
                 return Ok(ReadOutcome::Deadline);
             };

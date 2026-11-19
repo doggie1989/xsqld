@@ -406,6 +406,25 @@ fn rowid_bounds(c: &Connection, table: &str, rid: &str) -> Result<Option<(i64, i
 /// remaining parts are taken at the mean of their two densities. Exact for dense rowids and for a few rows far from the
 /// rest, close for evenly sparse ones (timestamps as ids); a table that is in fact small but has many clusters can be
 /// overestimated and then split: the result is the same, only the work is more.
+/// A cheap row-count estimate for one table, for callers outside the split path (the router's benefit gate).
+/// Uses the same rowid sampling as splitting, so both judge size the same way.
+pub fn estimate_table_rows(c: &Connection, table: &str) -> Option<i128> {
+    for rid in ["rowid", "_rowid_", "oid"] {
+        if let Ok(Some((lo, hi))) = rowid_bounds(c, table, rid) {
+            return estimate_rows(c, table, rid, lo, hi);
+        }
+    }
+    // A WITHOUT ROWID table has no rowid to sample. Counting it is a scan, but the caller caches the answer
+    // (`Readers::table_rows`, 10 s), so it is paid once per table per interval rather than per query.
+    c.query_row(
+        &format!("SELECT count(*) FROM {}", crate::htap::quote_identifier(table)),
+        [],
+        |r| r.get::<_, i64>(0),
+    )
+    .ok()
+    .map(i128::from)
+}
+
 fn estimate_rows(c: &Connection, table: &str, rid: &str, lo: i64, hi: i64) -> Option<i128> {
     const PARTS: i128 = 16;
     const BUDGET: usize = 256;
@@ -527,7 +546,7 @@ fn check_table(c: &Connection, shape: &Shape) -> Option<(&'static str, Vec<Strin
 }
 
 /// Collation of a column, from the schema (`sqlite3_table_column_metadata`), uppercased
-fn collation(c: &Connection, table: &str, column: &str) -> Option<String> {
+pub fn collation(c: &Connection, table: &str, column: &str) -> Option<String> {
     let t = std::ffi::CString::new(table).ok()?;
     let col = std::ffi::CString::new(column).ok()?;
     let mut coll: *const std::ffi::c_char = std::ptr::null();

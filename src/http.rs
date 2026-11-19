@@ -37,6 +37,7 @@ pub fn user_router(app: App) -> Router {
     let limits = Limits::new(&app.cfg, app.cfg.max_request_bytes);
     Router::new()
         .route("/v2/pipeline", post(pipeline))
+        .route("/v2/analytics", post(analytics))
         .route("/dump", get(dump))
         .route("/health", get(health))
         .route("/metrics", get(metrics))
@@ -216,7 +217,7 @@ impl Limits {
 
 /// When a request arrived (its head was read): the request's time limit counts from here, body reading included
 #[derive(Clone, Copy)]
-struct Arrived(Instant);
+pub(crate) struct Arrived(pub(crate) Instant);
 
 /// Every request: none for a Host that is not a local name and none from a web page (403, see [`refused`]), at most
 /// `--max-concurrent-requests` at once (more get 503 at once; `/health` is always answered, the watchdog must not take
@@ -290,6 +291,12 @@ async fn health() -> Response {
 }
 
 async fn metrics(State(app): State<App>) -> Response {
+    let out = metrics_text(&app);
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out).into_response()
+}
+
+/// The Prometheus text of `/metrics`, shared with the web console so both report the same series
+pub fn metrics_text(app: &App) -> String {
     let mut out = String::new();
     metrics::build_info(&mut out);
     let (streams, pinned) = app.streams.counts();
@@ -315,7 +322,7 @@ async fn metrics(State(app): State<App>) -> Response {
     for db in dbs {
         db.metrics.render(&db.name, &mut out);
     }
-    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out).into_response()
+    out
 }
 
 /// sqld-style error body `{"error": "…"}`
@@ -357,7 +364,7 @@ async fn database(app: &App, headers: &HeaderMap) -> Result<Arc<Db>, Box<Respons
     }
 }
 
-async fn pipeline(
+pub(crate) async fn pipeline(
     State(app): State<App>,
     axum::Extension(Arrived(started)): axum::Extension<Arrived>,
     headers: HeaderMap,
@@ -427,6 +434,49 @@ async fn pipeline(
             StatusCode::SERVICE_UNAVAILABLE,
             format!("Namespace `{}` is not available", db.name),
         ),
+    }
+}
+
+pub(crate) async fn analytics(
+    State(app): State<App>,
+    axum::Extension(Arrived(started)): axum::Extension<Arrived>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let request: crate::htap::Request = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(e) => return error(StatusCode::BAD_REQUEST, format!("Invalid analytics request: {e}")),
+    };
+    if let Err(e) = crate::htap::query_sql(&request.sql) {
+        return error(StatusCode::BAD_REQUEST, e.to_string());
+    }
+    let db = match database(&app, &headers).await {
+        Ok(db) => db,
+        Err(response) => return *response,
+    };
+    let deadline = started + app.cfg.request_timeout();
+    let htap = match db.analytics(app.cfg.clone(), deadline).await {
+        Ok(htap) => htap,
+        Err(e) => {
+            let status = if Instant::now() >= deadline {
+                StatusCode::GATEWAY_TIMEOUT
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            return error(status, e.to_string());
+        }
+    };
+    match tokio::task::spawn_blocking(move || htap.query(request, deadline)).await {
+        Ok(Ok(result)) => axum::Json(result).into_response(),
+        Ok(Err(e)) => {
+            let status = if Instant::now() >= deadline {
+                StatusCode::GATEWAY_TIMEOUT
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            error(status, e.to_string())
+        }
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 

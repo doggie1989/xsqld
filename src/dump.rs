@@ -99,6 +99,10 @@ fn export_in_tx(c: &rusqlite::Connection, out: &mut impl Write, preserve_rowids:
             out.write_all(b"ANALYZE sqlite_schema;\n")?;
         } else if name.starts_with("sqlite_") {
             continue;
+        } else if crate::htap::is_internal_object(&name) {
+            // the capture's own tables: not part of the database's data, and their contents (the source id) would
+            // make a database rebuilt from this dump claim to be the same source as the one it was copied from
+            continue;
         } else if sql.starts_with("CREATE VIRTUAL TABLE") {
             if !writable_schema {
                 out.write_all(b"PRAGMA writable_schema=ON;\n")?;
@@ -121,11 +125,17 @@ fn export_in_tx(c: &rusqlite::Connection, out: &mut impl Write, preserve_rowids:
         }
     }
     drop(rows);
-    let mut rest =
-        c.prepare("SELECT sql FROM sqlite_schema AS o WHERE sql NOT NULL AND type IN ('index','trigger','view')")?;
+    let mut rest = c.prepare(
+        "SELECT name, sql FROM sqlite_schema AS o WHERE sql NOT NULL AND type IN ('index','trigger','view')",
+    )?;
     let mut rows = rest.query([])?;
     while let Some(row) = rows.next()? {
-        let sql: String = row.get(0)?;
+        let name: String = row.get(0)?;
+        let sql: String = row.get(1)?;
+        if crate::htap::is_internal_object(&name) {
+            // the capture's triggers: they belong to the tables above, which this dump does not carry
+            continue;
+        }
         writeln!(out, "{sql};")?;
     }
     if writable_schema {
@@ -136,6 +146,26 @@ fn export_in_tx(c: &rusqlite::Connection, out: &mut impl Write, preserve_rowids:
 }
 
 fn dump_rows(c: &rusqlite::Connection, out: &mut impl Write, table: &str, preserve_rowids: bool) -> anyhow::Result<()> {
+    if table == "sqlite_sequence" {
+        // the sequence of a table this dump does not carry (the capture's own) would make the new database believe
+        // it is the same one
+        let mut st = c.prepare("SELECT name, seq FROM sqlite_sequence ORDER BY name")?;
+        let mut rows = st.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(0)?;
+            if crate::htap::is_internal_object(&name) {
+                continue;
+            }
+            let seq: i64 = row.get(1)?;
+            writeln!(
+                out,
+                "INSERT INTO sqlite_sequence VALUES({},{});",
+                Escaped(name.as_bytes()),
+                seq
+            )?;
+        }
+        return Ok(());
+    }
     let (rowid, cols) = table_columns(c, table, preserve_rowids)?;
     let mut insert = format!("INSERT INTO {}", Quoted(table));
     let mut select = String::from("SELECT ");

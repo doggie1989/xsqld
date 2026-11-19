@@ -58,6 +58,13 @@ pub struct Job {
     pub reply: oneshot::Sender<Outcome>,
     /// Already known to need running on its own
     solo: bool,
+    internal: Option<Internal>,
+}
+
+#[derive(Clone, Copy)]
+enum Internal {
+    HtapInstall,
+    HtapPrune(i64),
 }
 
 impl Job {
@@ -78,6 +85,7 @@ impl Job {
                 deadline,
                 reply,
                 solo,
+                internal: None,
             },
             rx,
         )
@@ -107,6 +115,9 @@ enum Msg {
     Job(Job),
     Stop(oneshot::Sender<()>),
 }
+
+/// What a commit does to wake the capture's sync: signal it and start its worker if it had gone idle
+type HtapWake = Arc<dyn Fn() + Send + Sync>;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -285,6 +296,28 @@ pub struct Writer {
     stopped: AtomicBool,
     metrics: Arc<DbMetrics>,
     max_queue: i64,
+    /// Called after a commit when the capture is installed: it both signals the sync and starts its worker if the
+    /// worker had gone idle. A channel alone would not do: a worker that exited leaves the signal unread, and the
+    /// mirror would stay behind until someone ran an analytical query.
+    htap_wake: Arc<Mutex<Option<HtapWake>>>,
+    htap_active: Arc<AtomicBool>,
+    /// A handle that does not own the writer: dropping it must not stop the write thread
+    borrowed: bool,
+}
+
+impl Clone for Writer {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            shared: self.shared.clone(),
+            stopped: AtomicBool::new(self.stopped.load(SeqCst)),
+            metrics: self.metrics.clone(),
+            max_queue: self.max_queue,
+            htap_wake: self.htap_wake.clone(),
+            htap_active: self.htap_active.clone(),
+            borrowed: true,
+        }
+    }
 }
 
 impl Writer {
@@ -303,6 +336,8 @@ impl Writer {
             pending: pending.clone(),
         };
         let w = Thread::open(path, cfg, inbox, streams, metrics.clone(), gate)?;
+        let htap_wake = w.htap_wake.clone();
+        let htap_active = w.conn.htap_active.clone();
         Ok(Writer {
             tx,
             shared: Arc::new(Shared {
@@ -318,6 +353,9 @@ impl Writer {
             stopped: AtomicBool::new(false),
             metrics,
             max_queue,
+            htap_wake,
+            htap_active,
+            borrowed: false,
         })
     }
 
@@ -358,6 +396,45 @@ impl Writer {
             && !self.shared.scheduled.load(SeqCst)
     }
 
+    fn internal_job(&self, internal: Internal, deadline: Instant) -> oneshot::Receiver<Outcome> {
+        let (mut job, rx) = Job::new(Vec::new(), 0, false, deadline);
+        job.solo = true;
+        job.internal = Some(internal);
+        self.submit(job);
+        rx
+    }
+
+    pub async fn install_htap(&self, deadline: Instant) -> anyhow::Result<()> {
+        match self.internal_job(Internal::HtapInstall, deadline).await? {
+            Outcome::Done { results, .. } => {
+                for result in results {
+                    if let crate::proto::StreamResult::Error { error } = result {
+                        anyhow::bail!("{}", error.message);
+                    }
+                }
+                Ok(())
+            }
+            other => anyhow::bail!("HTAP initialization failed: {other:?}"),
+        }
+    }
+
+    pub fn prune_htap(&self, wm: i64, deadline: Instant) {
+        drop(self.internal_job(Internal::HtapPrune(wm), deadline));
+    }
+
+    pub fn htap_enabled(&self) -> bool {
+        self.htap_active.load(Relaxed)
+    }
+
+    pub fn subscribe_htap(&self) -> (mpsc::SyncSender<()>, mpsc::Receiver<()>) {
+        mpsc::sync_channel(1)
+    }
+
+    /// Registers what a commit does to wake the capture's sync (see [`Writer::htap_wake`])
+    pub fn set_htap_wake(&self, wake: HtapWake) {
+        *self.htap_wake.lock().unwrap_or_else(|e| e.into_inner()) = Some(wake);
+    }
+
     /// Stops the writer: queued jobs are answered with [`Outcome::Unavailable`], an open transaction is rolled back,
     /// the WAL is checkpointed into the database file. Blocks until its connections are closed.
     pub fn stop(&self) {
@@ -378,8 +455,11 @@ impl Writer {
 
 impl Drop for Writer {
     /// A writer let go without [`Writer::stop`] still shuts down (rolls back, checkpoints, closes), on a worker and
-    /// without being waited for
+    /// without being waited for. A borrowed handle (a clone) does not: the writer it points at is owned elsewhere.
     fn drop(&mut self) {
+        if self.borrowed {
+            return;
+        }
         let _ = self.request_stop();
     }
 }
@@ -590,6 +670,7 @@ struct Thread {
     /// When the last request ran (or the last idle checkpoint was tried): the idle checkpoint is due
     /// `--checkpoint-idle-ms` after
     idle_since: Instant,
+    htap_wake: Arc<Mutex<Option<HtapWake>>>,
 }
 
 impl Thread {
@@ -626,6 +707,7 @@ impl Thread {
             stop: None,
             dirty: false,
             idle_since: Instant::now(),
+            htap_wake: Default::default(),
         })
     }
 
@@ -695,7 +777,7 @@ impl Thread {
     /// Takes a job off the queue: answers it without running when its client is gone or it waited too long
     fn admit(&self, job: Job) -> Option<Job> {
         self.metrics.queue_len.fetch_sub(1, Relaxed);
-        if job.reply.is_closed() {
+        if job.reply.is_closed() && job.internal.is_none() {
             return None;
         }
         let now = Instant::now();
@@ -895,6 +977,46 @@ impl Thread {
     /// Runs a request as written, on the bare connection (autocommit unless the stream is pinned)
     fn run_solo(&mut self, job: Job) {
         self.conn.set_deadline(Some(job.deadline));
+        if let Some(internal) = job.internal {
+            self.conn.internal.store(true, Relaxed);
+            let result = match internal {
+                Internal::HtapInstall => crate::htap::install_capture(&self.conn.c).map_err(|e| {
+                    rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                        Some(e.to_string()),
+                    )
+                }),
+                Internal::HtapPrune(wm) => self.conn.c.execute_batch(&format!(
+                    "BEGIN IMMEDIATE; UPDATE xsqld_htap_meta SET pruned_seq=max(pruned_seq,{wm}) WHERE id=1; \
+                     DELETE FROM xsqld_changelog WHERE seq<={wm}; \
+                     UPDATE sqlite_sequence SET seq=max(seq,{wm}) WHERE name='xsqld_changelog'; \
+                     INSERT INTO sqlite_sequence(name,seq) SELECT 'xsqld_changelog',{wm} \
+                     WHERE NOT EXISTS(SELECT 1 FROM sqlite_sequence WHERE name='xsqld_changelog'); COMMIT;"
+                )),
+            };
+            if result.is_err() {
+                self.conn.rollback_all();
+            } else if matches!(internal, Internal::HtapInstall) {
+                self.conn.htap_active.store(true, Relaxed);
+                self.metrics.htap_enabled.store(true, Relaxed);
+            }
+            self.conn.internal.store(false, Relaxed);
+            self.conn.set_deadline(None);
+            self.dirty = true;
+            let results = result
+                .err()
+                .map(|e| crate::proto::StreamResult::Error {
+                    error: sql::rusqlite_error(&e),
+                })
+                .into_iter()
+                .collect();
+            let _ = job.reply.send(Outcome::Done {
+                results,
+                closed: true,
+                pinned: false,
+            });
+            return;
+        }
         let mut ex = Exec::native(&self.conn, self.cfg.max_response_bytes);
         let results = match ex.run(&job.requests) {
             Ok(r) => r,
@@ -970,7 +1092,7 @@ impl Thread {
         while i < self.backlog.len() {
             let j = &self.backlog[i];
             let runs_out = (j.enqueued + queue_timeout).min(j.deadline);
-            if runs_out <= now || j.reply.is_closed() {
+            if runs_out <= now || (j.reply.is_closed() && j.internal.is_none()) {
                 let job = self.backlog.remove(i).expect("index is valid");
                 let _ = self.admit(job);
                 continue;
@@ -1034,6 +1156,10 @@ impl Thread {
         self.idle_since = Instant::now();
         if self.pinned.is_some() {
             return;
+        }
+        let wake = self.htap_wake.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(wake) = wake {
+            wake();
         }
         let frames = self.frames.load(Relaxed);
         self.metrics.wal_frames.store(frames, Relaxed);

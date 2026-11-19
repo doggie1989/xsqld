@@ -1,32 +1,18 @@
--- HTAP P0 outbox changelog + capture triggers (installed via xsqld pipeline).
--- Fires inside xsqld's own write transaction => atomic & durable with business data.
-
 CREATE TABLE IF NOT EXISTS xsqld_changelog(
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   tbl TEXT NOT NULL,
-  op  TEXT NOT NULL,            -- I / U / D
-  pk  INTEGER NOT NULL,
-  payload TEXT,                 -- I/U: new row JSON; D: NULL
-  ts  INTEGER NOT NULL          -- unixepoch() at capture, for lag measurement
+  op TEXT NOT NULL,
+  pk TEXT NOT NULL,
+  payload TEXT,
+  ts INTEGER NOT NULL
 );
-
-CREATE TRIGGER IF NOT EXISTS orders_ai AFTER INSERT ON orders BEGIN
-  INSERT INTO xsqld_changelog(tbl,op,pk,payload,ts)
-  VALUES('orders','I',NEW.id,
-    json_object('id',NEW.id,'user_id',NEW.user_id,'amount_cents',NEW.amount_cents,
-                'status',NEW.status,'channel',NEW.channel,'created_at',NEW.created_at),
-    unixepoch());
-END;
-
-CREATE TRIGGER IF NOT EXISTS orders_au AFTER UPDATE ON orders BEGIN
-  INSERT INTO xsqld_changelog(tbl,op,pk,payload,ts)
-  VALUES('orders','U',NEW.id,
-    json_object('id',NEW.id,'user_id',NEW.user_id,'amount_cents',NEW.amount_cents,
-                'status',NEW.status,'channel',NEW.channel,'created_at',NEW.created_at),
-    unixepoch());
-END;
-
-CREATE TRIGGER IF NOT EXISTS orders_ad AFTER DELETE ON orders BEGIN
-  INSERT INTO xsqld_changelog(tbl,op,pk,payload,ts)
-  VALUES('orders','D',OLD.id,NULL,unixepoch());
-END;
+CREATE TABLE IF NOT EXISTS xsqld_htap_meta(
+  id INTEGER PRIMARY KEY CHECK(id=1),
+  source_id TEXT NOT NULL,
+  pruned_seq INTEGER NOT NULL DEFAULT 0,
+  schema_fingerprint TEXT NOT NULL DEFAULT ''
+);
+INSERT OR IGNORE INTO xsqld_htap_meta(id,source_id) VALUES(1,lower(hex(randomblob(16))));
+UPDATE sqlite_sequence SET seq=max(seq,0) WHERE name='xsqld_changelog';
+INSERT INTO sqlite_sequence(name,seq) SELECT 'xsqld_changelog',0
+WHERE NOT EXISTS(SELECT 1 FROM sqlite_sequence WHERE name='xsqld_changelog');

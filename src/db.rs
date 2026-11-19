@@ -32,6 +32,8 @@ pub struct Db {
     pub metrics: Arc<DbMetrics>,
     /// When a request last asked for this database, in milliseconds since the registry was made (`--idle-close-ms`)
     last_used: AtomicU64,
+    htap: Arc<AsyncMutex<Option<Arc<crate::htap::Htap>>>>,
+    closed: std::sync::atomic::AtomicBool,
 }
 
 pub struct Registry {
@@ -148,11 +150,22 @@ impl Registry {
             let db = Arc::new(Db {
                 name: name.clone(),
                 writer,
-                readers: Arc::new(Readers::new(path, cfg, gate)),
+                readers: Arc::new(Readers::new(path, cfg.clone(), gate)),
                 metrics,
                 last_used: AtomicU64::new(now),
+                htap: Default::default(),
+                closed: Default::default(),
             });
             open.write().insert(name.clone(), db.clone());
+            if db.writer.htap_enabled() {
+                let active = db.clone();
+                tokio::runtime::Handle::current().spawn(async move {
+                    let deadline = std::time::Instant::now() + cfg.request_timeout();
+                    if let Err(error) = active.analytics(cfg, deadline).await {
+                        tracing::error!(ns = &*active.name, %error, "could not resume HTAP");
+                    }
+                });
+            }
             tracing::info!(ns = &*name, "database opened");
             Ok(Some(db))
         })
@@ -202,7 +215,7 @@ impl Registry {
             let Some(db) = db else { continue };
             let stopped = tokio::task::spawn_blocking(move || {
                 let _guard = guard;
-                db.writer.stop();
+                db.stop();
                 // the read connections close here, still under the database's lock
                 drop(db);
             })
@@ -220,6 +233,39 @@ impl Registry {
         let mut v: Vec<_> = self.open.read().values().cloned().collect();
         v.sort_by(|a, b| a.name.cmp(&b.name));
         v
+    }
+
+    pub fn uptime(&self) -> std::time::Duration {
+        self.started.elapsed()
+    }
+
+    /// Every namespace that has files on disk, whether it is open or not. The console lists them so a closed
+    /// database can be picked without knowing its name in advance.
+    pub fn namespaces(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for db in self.open_dbs() {
+            if seen.insert(db.name.to_string()) {
+                names.push(db.name.to_string());
+            }
+        }
+        let template = self.cfg.db_file_template.replace('\\', "/");
+        let parts: Vec<&str> = template.split('/').collect();
+        if let Some(k) = parts.iter().position(|p| p.contains("{ns}")) {
+            let base = parts[..k].iter().fold(self.cfg.db_path.clone(), |p, s| p.join(s));
+            if let Ok(entries) = std::fs::read_dir(&base) {
+                for entry in entries.flatten() {
+                    let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                        continue;
+                    };
+                    if self.cfg.usable_namespace(&name) && self.exists(&name) && seen.insert(name.clone()) {
+                        names.push(name);
+                    }
+                }
+            }
+        }
+        names.sort();
+        names
     }
 
     /// `POST /v1/namespaces/<ns>/create`: an empty database, or one built from an SQL dump (`dump` yields its bytes).
@@ -261,7 +307,7 @@ impl Registry {
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let _guard = guard;
             if let Some(db) = db {
-                db.writer.stop();
+                db.stop();
             }
             remove_files(&path, per_dir)
         })
@@ -275,8 +321,54 @@ impl Registry {
     pub fn shutdown(&self) {
         let dbs: Vec<_> = self.open.write().drain().map(|(_, d)| d).collect();
         for db in dbs {
-            db.writer.stop();
+            db.stop();
         }
+    }
+}
+
+impl Db {
+    pub async fn analytics(
+        self: &Arc<Self>,
+        cfg: Arc<Config>,
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<Arc<crate::htap::Htap>> {
+        let mut guard = tokio::time::timeout_at(deadline.into(), self.htap.clone().lock_owned()).await?;
+        anyhow::ensure!(
+            !self.closed.load(std::sync::atomic::Ordering::Acquire),
+            "namespace is shutting down"
+        );
+        if let Some(htap) = guard.as_ref() {
+            return Ok(htap.clone());
+        }
+        self.writer.install_htap(deadline).await?;
+        let path = cfg.db_file(&self.name);
+        let writer = self.writer.clone();
+        let gate = self.readers.gate.clone();
+        let metrics = self.metrics.clone();
+        let readers = self.readers.clone();
+        tokio::task::spawn_blocking(move || {
+            let htap = crate::htap::Htap::start(&path, cfg, writer, gate, metrics, deadline)?;
+            *guard = Some(htap.clone());
+            // the router may read this mirror from now on; it never installs one itself
+            readers.set_mirror(Some(htap.clone()));
+            Ok(htap)
+        })
+        .await?
+    }
+
+    /// The mirror of this database, if one is up; does not install one. Tests use it to drive the mirror directly.
+    #[cfg(test)]
+    pub fn mirror(&self) -> Option<Arc<crate::htap::Htap>> {
+        self.htap.try_lock().ok().and_then(|guard| guard.clone())
+    }
+
+    fn stop(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::Release);
+        self.readers.set_mirror(None);
+        if let Some(htap) = self.htap.blocking_lock().take() {
+            htap.stop();
+        }
+        self.writer.stop();
     }
 }
 
@@ -465,7 +557,10 @@ fn remove_files(db: &Path, per_dir: bool) -> anyhow::Result<()> {
             _ => return Ok(()),
         }
     }
-    for suffix in std::iter::once("").chain(SIDE_SUFFIXES) {
+    for suffix in std::iter::once("")
+        .chain(SIDE_SUFFIXES)
+        .chain([".duckdb", ".duckdb.wal"])
+    {
         match std::fs::remove_file(beside(db, suffix)) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
             _ => {}

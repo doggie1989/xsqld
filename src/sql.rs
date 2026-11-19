@@ -225,6 +225,25 @@ pub fn classify(sql: &str) -> Kind {
     }
 }
 
+/// `CREATE …`, `ALTER …` or `DROP …`: what can change the set or the shape of the tables the HTAP capture follows.
+/// Kept apart from [`classify`], whose kinds decide transaction handling and stay as sqld has them.
+pub fn is_ddl(sql: &str) -> bool {
+    matches!(Lexer::new(sql).next(), Some(Tok::Word(w)) if w == "CREATE" || w == "ALTER" || w == "DROP")
+}
+
+/// `ALTER TABLE …` or `DROP TABLE …`: SQLite itself drops the table's triggers and maintains its `sqlite_sequence`
+/// row while running these, which the HTAP capture's own protection would otherwise refuse
+pub fn is_table_ddl(sql: &str) -> bool {
+    let mut lx = Lexer::new(sql);
+    let Some(Tok::Word(first)) = lx.next() else {
+        return false;
+    };
+    if first != "ALTER" && first != "DROP" {
+        return false;
+    }
+    matches!(lx.next(), Some(Tok::Word(second)) if second == "TABLE")
+}
+
 /// `WITH [RECURSIVE] name AS (…) [, name AS (…)] <main statement>`: the first statement keyword outside parentheses
 /// that is not the name of a table expression (`WITH replace AS (…) SELECT …` is a SELECT)
 fn with_body(lx: &mut Lexer) -> Kind {

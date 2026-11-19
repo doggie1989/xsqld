@@ -263,11 +263,20 @@ impl<'c> Exec<'c> {
         kind: Kind,
         started: Instant,
     ) -> Result<StmtResult, proto::Error> {
+        let _table_ddl = sql::is_table_ddl(sql_text).then(|| self.conn.allow_table_ddl());
         let mut st = self
             .conn
             .prepare(sql_text)
             .map_err(|e| sql::prepare_error(&e, sql_text))?;
         bind(&mut st, stmt)?;
+        let reconcile_capture =
+            self.conn.htap_active.load(std::sync::atomic::Ordering::Relaxed) && sql::is_ddl(sql_text);
+        if reconcile_capture {
+            self.conn
+                .c
+                .execute_batch(&format!("SAVEPOINT {STMT_SP}"))
+                .map_err(|e| sql::rusqlite_error(&e))?;
+        }
         if self.grouped {
             match kind {
                 Kind::Begin(_) => {
@@ -356,7 +365,18 @@ impl<'c> Exec<'c> {
                 }
             }
         }
-        let rows = stepped?;
+        let rows = match stepped {
+            Ok(rows) => rows,
+            Err(error) => {
+                if reconcile_capture {
+                    let _ = self
+                        .conn
+                        .c
+                        .execute_batch(&format!("ROLLBACK TO {STMT_SP}; RELEASE {STMT_SP};"));
+                }
+                return Err(error);
+            }
+        };
         // read after stepping: a schema change since prepare makes SQLite recompile the statement on its first
         // step, and `SELECT *` then has the new columns
         let cols: Vec<Col> = st
@@ -366,6 +386,29 @@ impl<'c> Exec<'c> {
                 decltype: c.decl_type().map(str::to_owned),
             })
             .collect();
+        drop(st);
+        if reconcile_capture {
+            self.conn.internal.store(true, std::sync::atomic::Ordering::Relaxed);
+            let refreshed = crate::htap::refresh_capture_in_transaction(&self.conn.c);
+            self.conn.internal.store(false, std::sync::atomic::Ordering::Relaxed);
+            if let Err(error) = refreshed {
+                let _ = self
+                    .conn
+                    .c
+                    .execute_batch(&format!("ROLLBACK TO {STMT_SP}; RELEASE {STMT_SP};"));
+                return Err(sql::rusqlite_error(&rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                    Some(error.to_string()),
+                )));
+            }
+            if let Err(error) = self.conn.c.execute_batch(&format!("RELEASE {STMT_SP};")) {
+                let _ = self
+                    .conn
+                    .c
+                    .execute_batch(&format!("ROLLBACK TO {STMT_SP}; RELEASE {STMT_SP};"));
+                return Err(sql::rusqlite_error(&error));
+            }
+        }
         let affected = if kind.is_iud() { self.conn.c.changes() } else { 0 };
         let rows_read = rows.len() as u64;
         Ok(StmtResult {

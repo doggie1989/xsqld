@@ -31,6 +31,19 @@ pub struct Conn {
     deadline: Arc<AtomicU64>,
     /// Write connection: a COMMIT is turned into a ROLLBACK while this is set (see [`Conn::refuse_commits`])
     no_commit: Arc<AtomicBool>,
+    pub(crate) internal: Arc<AtomicBool>,
+    pub(crate) htap_active: Arc<AtomicBool>,
+    /// Set while a client's `ALTER TABLE`/`DROP TABLE` runs; see [`Conn::allow_table_ddl`]
+    table_ddl: Arc<AtomicBool>,
+}
+
+/// Ends the allowance [`Conn::allow_table_ddl`] opens, on every way the statement can end
+pub struct TableDdl(Arc<AtomicBool>);
+
+impl Drop for TableDdl {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
 }
 
 /// A compiled client statement: from the connection's statement cache (returned to it when dropped), or compiled for
@@ -65,7 +78,40 @@ impl Conn {
         let mut conn = Self::open(path, flags, cfg)?;
         conn.c.busy_timeout(Duration::from_millis(100))?;
         conn.apply_writer_settings(cfg)?;
-        conn.c.authorizer(Some(authorize_shared))?;
+        let active: bool = conn.c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='xsqld_htap_meta' AND type='table')",
+            [],
+            |r| r.get(0),
+        )?;
+        conn.htap_active.store(active, Ordering::Relaxed);
+        let (internal, htap) = (conn.internal.clone(), conn.htap_active.clone());
+        let table_ddl = conn.table_ddl.clone();
+        conn.c.authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+            use rusqlite::hooks::{AuthAction, Authorization};
+            if internal.load(Ordering::Relaxed) {
+                return Authorization::Allow;
+            }
+            if htap.load(Ordering::Relaxed) {
+                let ddl = table_ddl.load(Ordering::Relaxed);
+                match ctx.action {
+                    AuthAction::Insert { table_name }
+                    | AuthAction::Delete { table_name }
+                    | AuthAction::Update { table_name, .. }
+                        if !ddl && table_name.eq_ignore_ascii_case("sqlite_sequence") =>
+                    {
+                        return Authorization::Deny;
+                    }
+                    // SQLite drops the table's triggers itself; a client cannot name one in a table DDL
+                    AuthAction::DropTrigger { trigger_name, .. }
+                        if ddl && crate::htap::is_capture_trigger(trigger_name) =>
+                    {
+                        return Authorization::Allow;
+                    }
+                    _ => {}
+                }
+            }
+            authorize_shared(ctx)
+        }))?;
         let no_commit = conn.no_commit.clone();
         conn.c.commit_hook(Some(move || no_commit.load(Ordering::Relaxed)))?;
         Ok(conn)
@@ -78,6 +124,14 @@ impl Conn {
     /// before it written and then redone.
     pub fn refuse_commits(&self, on: bool) {
         self.no_commit.store(on, Ordering::Relaxed);
+    }
+
+    /// Lets SQLite's own bookkeeping for a client's `ALTER TABLE`/`DROP TABLE` through the capture's protection: it
+    /// drops the table's capture triggers and deletes or renames the table's `sqlite_sequence` row. Only table DDL
+    /// opens this, so a client still cannot drop a capture trigger or write `sqlite_sequence` by naming it.
+    pub fn allow_table_ddl(&self) -> TableDdl {
+        self.table_ddl.store(true, Ordering::Relaxed);
+        TableDdl(self.table_ddl.clone())
     }
 
     /// Compiles client SQL, trimmed ([`crate::sql::trimmed`]); statements up to [`CACHED_SQL_MAX`] go through the
@@ -126,6 +180,9 @@ impl Conn {
             c,
             deadline,
             no_commit: Arc::new(AtomicBool::new(false)),
+            internal: Arc::new(AtomicBool::new(false)),
+            htap_active: Arc::new(AtomicBool::new(false)),
+            table_ddl: Arc::new(AtomicBool::new(false)),
         };
         conn.apply_session_settings(cfg)?;
         Ok(conn)
@@ -302,7 +359,30 @@ const PRAGMA_READABLE: &[&str] = &[
 /// ([`crate::sql::prepare_error`]).
 fn authorize_shared(ctx: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization {
     use rusqlite::hooks::{AuthAction, Authorization};
+    let reserved =
+        |name: &str| name.eq_ignore_ascii_case("xsqld_changelog") || name.eq_ignore_ascii_case("xsqld_htap_meta");
+    let capture = crate::htap::is_capture_trigger;
     let allowed = match ctx.action {
+        AuthAction::CreateTable { table_name }
+        | AuthAction::DropTable { table_name }
+        | AuthAction::AlterTable { table_name, .. }
+        | AuthAction::Delete { table_name }
+        | AuthAction::Update { table_name, .. }
+            if reserved(table_name) =>
+        {
+            false
+        }
+        AuthAction::CreateTrigger {
+            trigger_name,
+            table_name,
+        }
+        | AuthAction::DropTrigger {
+            trigger_name,
+            table_name,
+        } if capture(trigger_name) || reserved(table_name) => false,
+        AuthAction::Insert { table_name } if reserved(table_name) => {
+            table_name.eq_ignore_ascii_case("xsqld_changelog") && ctx.accessor.is_some_and(capture)
+        }
         AuthAction::Pragma {
             pragma_name,
             pragma_value,

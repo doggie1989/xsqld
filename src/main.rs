@@ -7,15 +7,18 @@ mod conn;
 mod db;
 mod dump;
 mod exec;
+mod htap;
 mod http;
 mod metrics;
 mod parallel;
 mod pool;
 mod proto;
 mod reader;
+mod route;
 mod shape;
 mod sql;
 mod stream;
+mod ui;
 mod writer;
 
 use std::sync::Arc;
@@ -100,8 +103,33 @@ async fn main() -> anyhow::Result<()> {
 
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let user_srv = http::serve(user, http::user_router(registry.clone()), cfg.clone(), stop_rx.clone());
-    let admin_srv = http::serve(admin, http::admin_router(registry.clone()), cfg.clone(), stop_rx);
-    let servers = tokio::spawn(async move { tokio::join!(user_srv, admin_srv) });
+    let admin_srv = http::serve(
+        admin,
+        http::admin_router(registry.clone()),
+        cfg.clone(),
+        stop_rx.clone(),
+    );
+    let console = match cfg.ui_listen_addr {
+        Some(addr) => {
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            let token = ui::new_token();
+            tracing::info!(url = %format!("http://{addr}/ui?t={token}"), "web console");
+            Some(http::serve(
+                listener,
+                ui::router(registry.clone(), token),
+                cfg.clone(),
+                stop_rx,
+            ))
+        }
+        None => None,
+    };
+    let servers = tokio::spawn(async move {
+        if let Some(console) = console {
+            tokio::join!(user_srv, admin_srv, console);
+        } else {
+            tokio::join!(user_srv, admin_srv);
+        }
+    });
 
     shutdown_signal().await;
     tracing::info!("stopping: finishing requests in flight");

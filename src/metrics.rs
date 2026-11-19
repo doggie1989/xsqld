@@ -1,7 +1,7 @@
 //! Counters for `GET /metrics` (Prometheus text format). Plain atomics: updating them costs nothing on the hot path.
 
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
 
 /// Count, total and largest value of a duration; the largest is reset when read
@@ -71,6 +71,77 @@ pub struct DbMetrics {
     pub parallel_fallback: [AtomicU64; Fallback::ALL.len()],
     /// … time to combine the partial rows
     pub parallel_merge: Timer,
+    /// The analytical mirror (HTAP): its capture is installed on this database. The metrics below are
+    /// written only while it is, so a database without a mirror does not report a lag of zero.
+    pub htap_enabled: AtomicBool,
+    /// … the mirror's committed watermark, and the source position the sync last saw (`max(pruned_seq, MAX(seq))`).
+    /// Both move when the sync runs a batch or a query reads the position, so between those the lag is the last
+    /// known one, not a fresh reading of the source.
+    pub htap_watermark: AtomicI64,
+    pub htap_source_position: AtomicI64,
+    /// … batches that applied changes, and the changelog rows they carried
+    pub htap_batches: AtomicU64,
+    pub htap_rows_applied: AtomicU64,
+    pub htap_apply: Timer,
+    /// … times the mirror was rebuilt from the source instead of catching up from the changelog
+    pub htap_rebuilds: AtomicU64,
+    /// … batches that failed: the mirror keeps its old watermark and the next batch tries again
+    pub htap_sync_errors: AtomicU64,
+    /// … analytical queries served
+    pub htap_queries: AtomicU64,
+    pub htap_query: Timer,
+    /// SELECTs the router answered from the mirror instead of SQLite (`--route-enabled`)
+    pub route_runs: AtomicU64,
+    /// … and why the others stayed on SQLite, by [`RouteRefused`]
+    pub route_refused: [AtomicU64; RouteRefused::ALL.len()],
+}
+
+/// Why a SELECT was not answered from the mirror. Being refused only means SQLite answered it, which is always
+/// correct; these counts are how an operator sees why a query did not route.
+#[derive(Clone, Copy, Debug)]
+pub enum RouteRefused {
+    /// No mirror yet, or the sync failed, or it is shutting down
+    NotReady,
+    /// The mirror has not applied a committed write this query would need
+    Lagging,
+    /// The statement is not one SELECT the router handles
+    Shape,
+    /// The two engines would not answer alike (see tests/fixtures/engine-verdicts.json)
+    NotEquivalent,
+    /// A column has held more than one storage class
+    Impure,
+    /// The driving access path is a selective lookup, which the row store wins
+    Selective,
+    /// Too few rows for the mirror's fixed cost per query to pay off
+    Small,
+}
+
+impl RouteRefused {
+    pub const ALL: [RouteRefused; 7] = [
+        RouteRefused::NotReady,
+        RouteRefused::Lagging,
+        RouteRefused::Shape,
+        RouteRefused::NotEquivalent,
+        RouteRefused::Impure,
+        RouteRefused::Selective,
+        RouteRefused::Small,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NotReady => "not_ready",
+            Self::Lagging => "lagging",
+            Self::Shape => "shape",
+            Self::NotEquivalent => "not_equivalent",
+            Self::Impure => "impure",
+            Self::Selective => "selective",
+            Self::Small => "small",
+        }
+    }
+
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|r| r.label() == self.label()).unwrap_or(0)
+    }
 }
 
 /// Why a statement of the shape split-range parallel aggregation takes ran on one connection
@@ -166,6 +237,32 @@ impl DbMetrics {
             put(out, &format!("{name}_seconds_sum"), ns, Secs(u(&t.sum_us)));
             put(out, &format!("{name}_seconds_max"), ns, Secs(t.max_us.swap(0, Relaxed)));
         }
+        if self.htap_enabled.load(Relaxed) {
+            let watermark = i(&self.htap_watermark);
+            let source = i(&self.htap_source_position);
+            put(out, "htap_watermark", ns, watermark);
+            put(out, "htap_source_position", ns, source);
+            put(out, "htap_lag", ns, (source - watermark).max(0));
+            put(out, "htap_batches_total", ns, u(&self.htap_batches));
+            put(out, "htap_rows_applied_total", ns, u(&self.htap_rows_applied));
+            put(out, "htap_rebuilds_total", ns, u(&self.htap_rebuilds));
+            put(out, "htap_sync_errors_total", ns, u(&self.htap_sync_errors));
+            put(out, "htap_queries_total", ns, u(&self.htap_queries));
+            put(out, "route_runs_total", ns, u(&self.route_runs));
+            for (why, n) in RouteRefused::ALL.iter().zip(&self.route_refused) {
+                let _ = writeln!(
+                    out,
+                    "xsqld_route_refused_total{{ns=\"{ns}\",reason=\"{}\"}} {}",
+                    why.label(),
+                    u(n)
+                );
+            }
+            for (name, t) in [("htap_apply", &self.htap_apply), ("htap_query", &self.htap_query)] {
+                put(out, &format!("{name}_count"), ns, u(&t.count));
+                put(out, &format!("{name}_seconds_sum"), ns, Secs(u(&t.sum_us)));
+                put(out, &format!("{name}_seconds_max"), ns, Secs(t.max_us.swap(0, Relaxed)));
+            }
+        }
     }
 }
 
@@ -217,5 +314,38 @@ mod tests {
         m.render("tenant", &mut again);
         assert!(again.contains("xsqld_commit_seconds_max{ns=\"tenant\"} 0.000000\n"));
         assert!(again.contains("xsqld_parallel_fallback_total{ns=\"tenant\",reason=\"pool\"} 1\n"));
+    }
+
+    #[test]
+    fn htap_metrics_only_while_the_capture_is_installed() {
+        let m = DbMetrics::default();
+        let mut out = String::new();
+        m.render("t", &mut out);
+        assert!(!out.contains("htap_"), "{out}");
+        m.htap_enabled.store(true, Relaxed);
+        m.htap_watermark.store(5, Relaxed);
+        m.htap_source_position.store(9, Relaxed);
+        m.htap_batches.fetch_add(2, Relaxed);
+        m.htap_rows_applied.fetch_add(7, Relaxed);
+        m.htap_rebuilds.fetch_add(1, Relaxed);
+        m.htap_sync_errors.fetch_add(3, Relaxed);
+        m.htap_queries.fetch_add(4, Relaxed);
+        m.htap_apply.record(Duration::from_millis(2));
+        let mut out = String::new();
+        m.render("t", &mut out);
+        assert!(out.contains("xsqld_htap_watermark{ns=\"t\"} 5\n"), "{out}");
+        assert!(out.contains("xsqld_htap_source_position{ns=\"t\"} 9\n"), "{out}");
+        assert!(out.contains("xsqld_htap_lag{ns=\"t\"} 4\n"), "{out}");
+        assert!(out.contains("xsqld_htap_batches_total{ns=\"t\"} 2\n"), "{out}");
+        assert!(out.contains("xsqld_htap_rows_applied_total{ns=\"t\"} 7\n"), "{out}");
+        assert!(out.contains("xsqld_htap_rebuilds_total{ns=\"t\"} 1\n"), "{out}");
+        assert!(out.contains("xsqld_htap_sync_errors_total{ns=\"t\"} 3\n"), "{out}");
+        assert!(out.contains("xsqld_htap_queries_total{ns=\"t\"} 4\n"), "{out}");
+        assert!(out.contains("xsqld_htap_apply_count{ns=\"t\"} 1\n"), "{out}");
+        // a mirror ahead of the last known source position does not report a negative lag
+        m.htap_source_position.store(3, Relaxed);
+        let mut out = String::new();
+        m.render("t", &mut out);
+        assert!(out.contains("xsqld_htap_lag{ns=\"t\"} 0\n"), "{out}");
     }
 }
