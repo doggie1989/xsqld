@@ -1,142 +1,104 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 
-/// Files SQLite keeps next to a database file, named by appending these
-pub const SIDE_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
-
-/// Largest `--max-like-pattern-bytes`: the deepest recursion of SQLite's LIKE / GLOB matcher such a pattern allows
-/// still fits on a 2 MiB thread stack (`long_like_patterns_are_refused` runs it there)
-pub const MAX_LIKE_PATTERN_BYTES: i32 = 10_000;
-
-/// Release version; Cargo.toml is its only source (release tags are `xsqld-v<version>`)
+/// Release version; Cargo.toml is its only source
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Git commit the binary was built from (`build.rs`), `unknown` without git
 pub const COMMIT: &str = env!("XSQLD_GIT_COMMIT");
 
-/// Command line flags. Names and defaults of the first group follow sqld, so an existing
-/// `sqld --db-path … --http-listen-addr … --admin-listen-addr … --enable-namespaces` command line works unchanged.
+/// Backend system databases that must never be exposed or dropped as Hrana namespaces
+pub const RESERVED_NAMESPACES: [&str; 5] = [
+    "oceanbase",
+    "mysql",
+    "information_schema",
+    "performance_schema",
+    "sys",
+];
+
 #[derive(Parser, Debug, Clone, serde::Serialize)]
 #[command(
     name = "xsqld",
     version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("XSQLD_GIT_COMMIT"), ")"),
-    about = "Local-only SQLite server speaking the sqld Hrana-over-HTTP subset"
+    about = "Hrana-over-HTTP gateway backed by SeekDB / OceanBase / MySQL"
 )]
 pub struct Config {
-    /// Data directory; database files are resolved from it with --db-file-template
-    #[arg(long, default_value = "data.sqld")]
-    pub db_path: PathBuf,
-    /// Hrana over HTTP (`/v2/pipeline`, `/dump`, `/health`, `/metrics`)
+    /// MySQL / SeekDB host to connect to
+    #[arg(long, env = "XSQLD_MYSQL_HOST", default_value = "127.0.0.1")]
+    pub mysql_host: String,
+    /// MySQL / SeekDB port to connect to
+    #[arg(long, env = "XSQLD_MYSQL_PORT", default_value_t = 2881)]
+    pub mysql_port: u16,
+    /// MySQL / SeekDB username
+    #[arg(long, env = "XSQLD_MYSQL_USER", default_value = "root")]
+    pub mysql_user: String,
+    /// MySQL / SeekDB password (can also be supplied via XSQLD_MYSQL_PASSWORD)
+    #[arg(long, env = "XSQLD_MYSQL_PASSWORD", default_value = "")]
+    #[serde(skip_serializing)]
+    pub mysql_password: String,
+    /// Full MySQL connection URL (e.g. mysql://user:pass@host:2881). Overrides --mysql-host/port/user/password
+    #[arg(long, env = "XSQLD_MYSQL_URL")]
+    #[serde(skip_serializing)]
+    pub mysql_url: Option<String>,
+
+    /// Optional static Bearer token checked via `Authorization: Bearer <token>` on all endpoints except `/health`
+    #[arg(long, env = "XSQLD_AUTH_TOKEN")]
+    #[serde(skip_serializing)]
+    pub auth_token: Option<String>,
+
+    /// Hrana over HTTP (`/v2/pipeline`, `/health`, `/metrics`)
     #[arg(long, default_value = "127.0.0.1:8080")]
     pub http_listen_addr: SocketAddr,
-    /// Admin API (`/v1/namespaces/<ns>/create`, `DELETE /v1/namespaces/<ns>`, `/metrics`)
+    /// Admin API (`/v1/namespaces/<ns>/create`, `DELETE /v1/namespaces/<ns>`, `/health`, `/metrics`)
     #[arg(long, default_value = "127.0.0.1:8081")]
     pub admin_listen_addr: SocketAddr,
-    /// Answer a SELECT from the DuckDB mirror when the two engines provably agree and the mirror is ahead enough
-    /// to be worth it. Off by default; needs a namespace whose mirror already exists (see /v2/analytics).
-    #[arg(long)]
-    pub route_enabled: bool,
-    /// Single-table SELECTs are routed only above this many estimated rows: below it the mirror's fixed cost per
-    /// query outweighs what a columnar scan saves (measured: the mirror is slower on a 178k-row database)
-    #[arg(long, default_value = "200000")]
-    pub route_min_rows: u64,
-    /// Web console (`/ui`): parameters, schema, metrics and a SQL workbench. Off by default, loopback only, and
-    /// guarded by the token printed at startup. The Hrana and admin ports keep refusing browser requests.
-    #[arg(long)]
-    pub ui_listen_addr: Option<SocketAddr>,
+
     /// Accepted for sqld command line compatibility; namespaces are always on
     #[arg(long, hide = true)]
     pub enable_namespaces: bool,
-    /// Accepted for sqld command line compatibility; ignored (there is no replication log)
+    /// Accepted for sqld command line compatibility; ignored
     #[arg(long, hide = true)]
     pub max_log_size: Option<u64>,
 
-    /// Database file of a namespace, relative to --db-path; `{ns}` is replaced by the namespace name
-    #[arg(long, default_value = "dbs/{ns}/data")]
-    pub db_file_template: String,
     /// Allow listening on non-loopback addresses (refused by default)
     #[arg(long)]
     pub allow_non_loopback: bool,
-    /// Allow `dump_url` hosts other than loopback addresses (refused by default)
-    #[arg(long)]
-    pub allow_remote_dump_url: bool,
     /// Requests are answered only when their Host header is an IP address, a name without a dot (`localhost`,
     /// `sqld-admin`) or a name under one of these suffixes (comma separated); others get 403. `*` accepts every Host
     #[arg(long, value_delimiter = ',', default_value = "db,local,localhost")]
     pub allowed_host_suffixes: Vec<String>,
 
-    /// PRAGMA synchronous of the write connection
-    #[arg(long, value_enum, default_value = "full")]
-    pub synchronous: Synchronous,
-    /// PRAGMA cache_size of every connection (negative = KiB, like SQLite)
-    #[arg(long, default_value_t = -2000, allow_hyphen_values = true)]
-    pub cache_size: i64,
-    /// Read connections per database: this many slow reads fill the pool and the next reads of that database wait.
-    /// Default: the number of CPUs, at least 16
-    #[arg(long, default_value_t = default_read_pool_size())]
-    pub read_pool_size: usize,
-
-    /// Most client transactions committed together in one group
+    /// Minimum idle connections retained in each namespace's MySQL connection pool
+    #[arg(long, default_value_t = 2)]
+    pub pool_min: usize,
+    /// Maximum connections opened in each namespace's MySQL connection pool
     #[arg(long, default_value_t = 64)]
-    pub group_max: usize,
-    /// How long the write thread waits for more work before committing a group, in microseconds
-    #[arg(long, default_value_t = 0)]
-    pub group_linger_us: u64,
-    /// A group that has been running this long is committed before its next request: the requests already done get
-    /// their reply instead of waiting for slow ones after them
-    #[arg(long, default_value_t = 20)]
-    pub group_max_exec_ms: u64,
-    /// Most write requests waiting for one database; more are answered with 503 without running
-    #[arg(long, default_value_t = 4096)]
-    pub max_write_queue: usize,
-    /// A write request waiting longer than this in the queue is answered with an error without running
-    #[arg(long, default_value_t = 40_000)]
-    pub queue_timeout_ms: u64,
-    /// Time limit of one HTTP request (queueing plus execution); SQL still running at the deadline is interrupted
+    pub pool_max: usize,
+    /// Prepared statement cache capacity per pooled MySQL connection
+    #[arg(long, default_value_t = 64)]
+    pub stmt_cache_size: usize,
+    /// Maximum queries executing concurrently against the MySQL backend across all namespaces
+    #[arg(long, default_value_t = 128)]
+    pub max_concurrent_queries: usize,
+    /// Close and release a namespace's connection pool after it has been idle this long (0: never close)
+    #[arg(long, default_value_t = 300_000)]
+    pub idle_close_ms: u64,
+
+    /// Time limit of one HTTP request (acquiring connection plus SQL execution); SQL still running at deadline is killed
     #[arg(long, default_value_t = 40_000)]
     pub request_timeout_ms: u64,
     /// A stream (baton) unused for this long expires
     #[arg(long, default_value_t = 10_000)]
     pub stream_idle_ms: u64,
-    /// A transaction left open across HTTP requests is rolled back after this long
+    /// A transaction left open across HTTP requests is rolled back and unpinned after this long
     #[arg(long, default_value_t = 5_000)]
     pub pinned_tx_timeout_ms: u64,
 
-    /// Passive checkpoint (checkpoint thread) once the WAL holds this many frames; a tail this long or shorter left by
-    /// that thread is copied by the write thread between groups. Writes wait for a checkpoint run once this many
-    /// frames have been written since it began
-    #[arg(long, default_value_t = 1000)]
-    pub checkpoint_pages: u32,
-    /// Once the WAL holds this many bytes the write thread checkpoints all of it between groups and waits for
-    /// readers (RESTART), so that the WAL starts over
-    #[arg(long, default_value_t = 32 * 1024 * 1024)]
-    pub checkpoint_restart_bytes: u64,
-    /// After a RESTART failed because of readers, the next one holds back new read requests and waits up to this
-    /// long for the reads already running to end (checkpoint starvation; README §3)
-    #[arg(long, default_value_t = 200)]
-    pub checkpoint_reader_wait_ms: u64,
-    /// Checkpoint by the write thread after it has been idle this long (0: never). The WAL file keeps its size; it
-    /// is only truncated on shutdown
-    #[arg(long, default_value_t = 1_000)]
-    pub checkpoint_idle_ms: u64,
-    /// A database no request has used for this long is closed: its WAL is checkpointed into the database file and
-    /// its connections are closed; the next request opens it again (0: databases stay open)
-    #[arg(long, default_value_t = 300_000)]
-    pub idle_close_ms: u64,
-    /// Most threads running the databases' writes and checkpoints at once (shared by all databases; threads are
-    /// started as work arrives and end when idle)
-    #[arg(long, default_value_t = 256)]
-    pub max_worker_threads: usize,
-    /// PRAGMA journal_size_limit of the write connection
-    #[arg(long, default_value_t = 64 * 1024 * 1024)]
-    pub journal_size_limit: i64,
-
-    /// Largest request body
+    /// Largest HTTP request body in bytes
     #[arg(long, default_value_t = 16 * 1024 * 1024)]
     pub max_request_bytes: usize,
-    /// Open client connections per port; further connections wait in the listen backlog
+    /// Open HTTP client connections per port; further connections wait in the listen backlog
     #[arg(long, default_value_t = 1024)]
     pub max_connections: usize,
     /// Requests being handled at once per port; more are answered with 503
@@ -151,85 +113,15 @@ pub struct Config {
     /// A response the client takes no data of for this long is abandoned and its connection closed
     #[arg(long, default_value_t = 60_000)]
     pub response_write_timeout_ms: u64,
-    /// `GET /dump`: the client must take the next chunk within this long, or the dump is abandoned
-    #[arg(long, default_value_t = 60_000)]
-    pub dump_stall_timeout_ms: u64,
-    /// `GET /dump`: longest a dump may take
-    #[arg(long, default_value_t = 3_600_000)]
-    pub dump_max_ms: u64,
-    /// `GET /dump` running at once (each copies its database to disk first); more are answered with 503
-    #[arg(long, default_value_t = 2)]
-    pub max_concurrent_dumps: usize,
-    /// `dump_url`: longest the whole download may take
-    #[arg(long, default_value_t = 1_800_000)]
-    pub dump_url_timeout_ms: u64,
-    /// Creating a database from a dump: longest one statement of the dump may be, in bytes
-    #[arg(long, default_value_t = 128 * 1024 * 1024)]
-    pub dump_load_max_statement_bytes: usize,
-    /// Creating a database from a dump: longest the whole load (download included) may take
-    #[arg(long, default_value_t = 1_800_000)]
-    pub dump_load_timeout_ms: u64,
     /// Most statements (execute requests plus batch steps) in one HTTP request
     #[arg(long, default_value_t = 4096)]
     pub max_statements: usize,
     /// Largest result of one HTTP request (estimated JSON size of all rows)
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
     pub max_response_bytes: u64,
-    /// SQLITE_LIMIT_LENGTH: largest string or blob value (sqld's max_row_size)
-    #[arg(long, default_value_t = 5 * 1024 * 1024)]
-    pub max_value_bytes: i32,
-    /// SQLITE_LIMIT_LIKE_PATTERN_LENGTH: longest LIKE or GLOB pattern (SQLite and sqld: 50000)
-    #[arg(long, default_value_t = 1000)]
-    pub max_like_pattern_bytes: i32,
-
-    /// Split-range parallel aggregation (README §3.1): most rowid ranges, each on its own read connection, one
-    /// statement is split into (also no more than the CPUs)
-    #[arg(long, default_value_t = 4)]
-    pub parallel_max_ranges: usize,
-    /// Split-range parallel aggregation: tables with fewer rows than this (estimated from the rowid b-tree) run on one
-    /// connection
-    #[arg(long, default_value_t = 1_000_000)]
-    pub parallel_min_rows: u64,
-    /// Split-range parallel aggregation: percentage of --read-pool-size that the additional connections of all split
-    /// statements together may hold; when that many are in use, or the pool has no idle permit, statements run on one
-    /// connection without waiting
-    #[arg(long, default_value_t = 50)]
-    pub parallel_pool_percent: usize,
-    /// Split-range parallel aggregation: most partial rows (groups times ranges) one statement may collect; past this
-    /// it is run again on one connection
-    #[arg(long, default_value_t = 1_000_000)]
-    pub parallel_max_partial_rows: usize,
-    /// DuckDB's managed memory limit per active namespace (not a process RSS limit)
-    #[arg(long, default_value_t = 512)]
-    pub htap_memory_limit_mb: u64,
-    /// How long the HTAP sync worker stays on the shared pool without work before releasing its worker thread
-    #[arg(long, default_value_t = 10_000)]
-    pub htap_worker_idle_ms: u64,
-}
-
-#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub enum Synchronous {
-    Off,
-    Normal,
-    Full,
-    Extra,
-}
-
-impl Synchronous {
-    pub fn pragma(self) -> &'static str {
-        match self {
-            Self::Off => "OFF",
-            Self::Normal => "NORMAL",
-            Self::Full => "FULL",
-            Self::Extra => "EXTRA",
-        }
-    }
 }
 
 impl Config {
-    pub fn queue_timeout(&self) -> Duration {
-        Duration::from_millis(self.queue_timeout_ms)
-    }
     pub fn request_timeout(&self) -> Duration {
         Duration::from_millis(self.request_timeout_ms)
     }
@@ -239,57 +131,21 @@ impl Config {
     pub fn pinned_tx_timeout(&self) -> Duration {
         Duration::from_millis(self.pinned_tx_timeout_ms)
     }
-    pub fn checkpoint_idle(&self) -> Duration {
-        Duration::from_millis(self.checkpoint_idle_ms)
-    }
-    pub fn htap_worker_idle(&self) -> Duration {
-        Duration::from_millis(self.htap_worker_idle_ms)
-    }
-    pub fn group_max_exec(&self) -> Duration {
-        Duration::from_millis(self.group_max_exec_ms)
-    }
     pub fn header_read_timeout(&self) -> Duration {
         Duration::from_millis(self.header_read_timeout_ms)
     }
     pub fn body_read_timeout(&self) -> Duration {
         Duration::from_millis(self.body_read_timeout_ms)
     }
-    pub fn dump_stall_timeout(&self) -> Duration {
-        Duration::from_millis(self.dump_stall_timeout_ms)
-    }
-    pub fn dump_max(&self) -> Duration {
-        Duration::from_millis(self.dump_max_ms)
-    }
-    pub fn dump_url_timeout(&self) -> Duration {
-        Duration::from_millis(self.dump_url_timeout_ms)
-    }
-    pub fn dump_load_timeout(&self) -> Duration {
-        Duration::from_millis(self.dump_load_timeout_ms)
-    }
-    pub fn checkpoint_reader_wait(&self) -> Duration {
-        Duration::from_millis(self.checkpoint_reader_wait_ms)
-    }
     pub fn response_write_timeout(&self) -> Duration {
         Duration::from_millis(self.response_write_timeout_ms)
     }
 
-    /// Additional read connections all split statements of a database may hold together (at least one, so that a
-    /// pool of 16 at 10% still splits into two ranges)
-    pub fn parallel_permits(&self) -> usize {
-        (self.read_pool_size * self.parallel_pool_percent / 100).max(1)
-    }
-
     /// Is a request with this Host header answered? (`--allowed-host-suffixes`)
-    ///
-    /// The database is chosen by the Host header and nothing else identifies a client, so a web page whose domain
-    /// has been re-pointed at this machine (DNS rebinding) would read and write as a local client. Such a page's
-    /// Host is the attacker's domain; the hosts local clients use are IP addresses, single names and names under a
-    /// few private suffixes.
     pub fn host_allowed(&self, host: &str) -> bool {
         if self.allowed_host_suffixes.iter().any(|s| s == "*") {
             return true;
         }
-        // `[::1]:8080`: an IPv6 address
         if host.starts_with('[') {
             return true;
         }
@@ -308,42 +164,34 @@ impl Config {
         })
     }
 
-    /// Scratch files of the server (copies made for `GET /dump`); emptied at startup
-    pub fn tmp_dir(&self) -> PathBuf {
-        self.db_path.join("xsqld-tmp")
-    }
-
-    /// Database file of a namespace
-    pub fn db_file(&self, ns: &str) -> PathBuf {
-        self.db_path.join(self.db_file_template.replace("{ns}", ns))
-    }
-
-    /// The template puts each namespace in a directory of its own (sqld layout `dbs/{ns}/data`):
-    /// deleting a namespace removes that directory
-    pub fn per_namespace_dir(&self) -> bool {
-        let t = self.db_file_template.replace('\\', "/");
-        t.split('/').rev().skip(1).any(|part| part == "{ns}")
-    }
-
-    /// A name the server may use as a database: a valid name whose file does not fall inside the server's scratch
-    /// directory (`xsqld-tmp` under a template such as `{ns}/data`, emptied at every start)
+    /// Whether a namespace name is structurally valid and does not target a system database
     pub fn usable_namespace(&self, ns: &str) -> bool {
-        valid_namespace(ns) && !self.db_file(ns).starts_with(self.tmp_dir())
+        valid_namespace(ns) && !RESERVED_NAMESPACES.iter().any(|r| r.eq_ignore_ascii_case(ns))
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        self.validate_template()?;
         for addr in [self.http_listen_addr, self.admin_listen_addr] {
             if !addr.ip().is_loopback() && !self.allow_non_loopback {
                 anyhow::bail!("refusing to listen on non-loopback address {addr} (pass --allow-non-loopback)");
             }
         }
-        // The console executes SQL and has no authentication beyond its token, so it stays on this machine even
-        // with --allow-non-loopback: that flag is about the client ports.
-        if let Some(addr) = self.ui_listen_addr
-            && !addr.ip().is_loopback()
+        if self.pool_min > self.pool_max {
+            anyhow::bail!(
+                "--pool-min ({}) must not exceed --pool-max ({})",
+                self.pool_min,
+                self.pool_max
+            );
+        }
+        if let Some(tok) = &self.auth_token
+            && tok.is_empty()
         {
-            anyhow::bail!("--ui-listen-addr must be a loopback address, got {addr}");
+            anyhow::bail!("--auth-token must not be empty");
+        }
+        if self.mysql_host.trim().is_empty() && self.mysql_url.is_none() {
+            anyhow::bail!("--mysql-host must not be empty");
+        }
+        if self.mysql_user.trim().is_empty() && self.mysql_url.is_none() {
+            anyhow::bail!("--mysql-user must not be empty");
         }
         for (flag, value, min, max) in self.numeric_bounds() {
             if !(min..=max).contains(&value) {
@@ -353,75 +201,21 @@ impl Config {
         Ok(())
     }
 
-    /// `--db-file-template` must keep every database inside `--db-path` and the files of one database apart from
-    /// those of every other: with a file name ending in `{ns}`, the database `a-wal` would be the WAL of `a`, and
-    /// deleting one would remove the other's files
-    fn validate_template(&self) -> anyhow::Result<()> {
-        let t = &self.db_file_template;
-        if !t.contains("{ns}") {
-            anyhow::bail!("--db-file-template must contain {{ns}}");
-        }
-        let path = std::path::Path::new(t);
-        if path.is_absolute() || t.split(['/', '\\']).any(|p| p.is_empty() || p == "." || p == "..") {
-            anyhow::bail!("--db-file-template must be a relative path below --db-path, without `.` or `..`: {t}");
-        }
-        let file = path.file_name().and_then(|f| f.to_str()).unwrap_or_default();
-        if let Some(at) = file.rfind("{ns}") {
-            // the file of database B is a side file of database A when B + S = A + S + side, i.e. when S + side
-            // ends with S and what it adds in front of S could be part of a name
-            let s = &file[at + "{ns}".len()..];
-            for side in SIDE_SUFFIXES {
-                let longer = format!("{s}{side}");
-                let added = &longer[..side.len()];
-                if longer.ends_with(s) && valid_namespace(&format!("a{added}")) {
-                    anyhow::bail!(
-                        "--db-file-template {t}: the file of a database named `<name>{added}` would be the \
-                         `{side}` file of the database `<name>`; put something after {{ns}} in the file name, e.g. \
-                         {{ns}}.db"
-                    );
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Every numeric flag with the range it must be in. Upper bounds keep durations from overflowing the clock
-    /// (`Instant + Duration` panics), counts within what a semaphore holds, and sizes and SQLite limits in a range
-    /// where they still limit something (SQLite ignores a negative limit and keeps its own default)
-    fn numeric_bounds(&self) -> [(&'static str, i128, i128, i128); 40] {
+    fn numeric_bounds(&self) -> [(&'static str, i128, i128, i128); 17] {
         const HOUR_MS: i128 = 3_600_000;
         const GIB: i128 = 1 << 30;
         let n = |v: usize| v as i128;
         let u = |v: u64| v as i128;
         [
-            ("route-min-rows", u(self.route_min_rows), 1000, 1 << 50),
-            ("cache-size", self.cache_size as i128, -(1 << 30), 1 << 30),
-            ("read-pool-size", n(self.read_pool_size), 1, 1024),
-            ("group-max", n(self.group_max), 1, 65_536),
-            ("group-linger-us", u(self.group_linger_us), 0, 1_000_000),
-            ("group-max-exec-ms", u(self.group_max_exec_ms), 0, 60_000),
-            ("max-write-queue", n(self.max_write_queue), 1, 1_000_000),
-            ("queue-timeout-ms", u(self.queue_timeout_ms), 0, HOUR_MS),
+            ("mysql-port", self.mysql_port as i128, 1, 65_535),
+            ("pool-min", n(self.pool_min), 0, 1024),
+            ("pool-max", n(self.pool_max), 1, 1024),
+            ("stmt-cache-size", n(self.stmt_cache_size), 0, 4096),
+            ("max-concurrent-queries", n(self.max_concurrent_queries), 1, 65_536),
+            ("idle-close-ms", u(self.idle_close_ms), 0, 24 * HOUR_MS),
             ("request-timeout-ms", u(self.request_timeout_ms), 1, HOUR_MS),
             ("stream-idle-ms", u(self.stream_idle_ms), 1, 24 * HOUR_MS),
             ("pinned-tx-timeout-ms", u(self.pinned_tx_timeout_ms), 1, HOUR_MS),
-            ("checkpoint-pages", self.checkpoint_pages as i128, 1, 1_000_000),
-            (
-                "checkpoint-restart-bytes",
-                u(self.checkpoint_restart_bytes),
-                4096,
-                1024 * GIB,
-            ),
-            (
-                "checkpoint-reader-wait-ms",
-                u(self.checkpoint_reader_wait_ms),
-                0,
-                60_000,
-            ),
-            ("checkpoint-idle-ms", u(self.checkpoint_idle_ms), 0, HOUR_MS),
-            ("idle-close-ms", u(self.idle_close_ms), 0, 24 * HOUR_MS),
-            ("max-worker-threads", n(self.max_worker_threads), 1, 65_536),
-            ("journal-size-limit", self.journal_size_limit as i128, -1, 1024 * GIB),
             ("max-request-bytes", n(self.max_request_bytes), 1024, GIB),
             ("max-connections", n(self.max_connections), 1, 1_000_000),
             ("max-concurrent-requests", n(self.max_concurrent_requests), 1, 1_000_000),
@@ -433,65 +227,18 @@ impl Config {
                 1,
                 HOUR_MS,
             ),
-            ("dump-stall-timeout-ms", u(self.dump_stall_timeout_ms), 1, 24 * HOUR_MS),
-            ("dump-max-ms", u(self.dump_max_ms), 0, 7 * 24 * HOUR_MS),
-            ("max-concurrent-dumps", n(self.max_concurrent_dumps), 1, 1024),
-            ("dump-url-timeout-ms", u(self.dump_url_timeout_ms), 1, 7 * 24 * HOUR_MS),
-            (
-                "dump-load-max-statement-bytes",
-                n(self.dump_load_max_statement_bytes),
-                1024,
-                GIB,
-            ),
-            (
-                "dump-load-timeout-ms",
-                u(self.dump_load_timeout_ms),
-                1,
-                7 * 24 * HOUR_MS,
-            ),
             ("max-statements", n(self.max_statements), 1, 1_000_000),
             ("max-response-bytes", u(self.max_response_bytes), 1024, 16 * GIB),
-            // SQLITE_MAX_LENGTH, SQLite's own ceiling
-            ("max-value-bytes", self.max_value_bytes as i128, 1, 1_000_000_000),
-            // the deepest recursion of SQLite's matcher such a pattern allows still fits on the smallest thread
-            // stack of the server (2 MiB; README §1.1)
-            (
-                "max-like-pattern-bytes",
-                self.max_like_pattern_bytes as i128,
-                1,
-                MAX_LIKE_PATTERN_BYTES as i128,
-            ),
-            // at least two ranges: below that there is nothing to split (there is no setting that turns it off)
-            ("parallel-max-ranges", n(self.parallel_max_ranges), 2, 64),
-            ("parallel-min-rows", u(self.parallel_min_rows), 1000, 1 << 50),
-            ("parallel-pool-percent", n(self.parallel_pool_percent), 10, 90),
-            (
-                "parallel-max-partial-rows",
-                n(self.parallel_max_partial_rows),
-                1000,
-                100_000_000,
-            ),
-            ("htap-memory-limit-mb", u(self.htap_memory_limit_mb), 16, 1_048_576),
-            ("htap-worker-idle-ms", u(self.htap_worker_idle_ms), 100, HOUR_MS),
         ]
     }
 
     #[cfg(test)]
-    pub fn for_tests(dir: &std::path::Path) -> Self {
-        let mut c = Config::parse_from(["xsqld"]);
-        c.db_path = dir.to_path_buf();
-        c.htap_worker_idle_ms = 200;
-        c
+    pub fn for_tests() -> Self {
+        Config::parse_from(["xsqld"])
     }
 }
 
-/// One read per CPU at a time, but never fewer than 16 connections: fewer would let a handful of slow queries hold up
-/// every quick read of the database. `available_parallelism` follows CPU affinity and cgroup quotas.
-fn default_read_pool_size() -> usize {
-    std::thread::available_parallelism().map_or(1, |n| n.get()).max(16)
-}
-
-/// Namespace names: letters, digits, `-` and `_`, starting with a letter or digit (also keeps paths safe)
+/// Namespace names: letters, digits, `-` and `_`, starting with a letter or digit (<= 64 chars)
 pub fn valid_namespace(ns: &str) -> bool {
     let b = ns.as_bytes();
     !b.is_empty()
@@ -507,6 +254,7 @@ mod tests {
 
     #[test]
     fn namespace_names() {
+        let c = Config::for_tests();
         assert!(valid_namespace("tenant"));
         assert!(valid_namespace("restore-check"));
         assert!(valid_namespace("TDB_000"));
@@ -515,12 +263,16 @@ mod tests {
         assert!(!valid_namespace(".tmp"));
         assert!(!valid_namespace("a/b"));
         assert!(!valid_namespace(&"a".repeat(65)));
+
+        assert!(c.usable_namespace("tenant"));
+        for sys in ["oceanbase", "OceanBase", "mysql", "MySQL", "information_schema", "performance_schema", "sys"] {
+            assert!(!c.usable_namespace(sys), "{sys} must be rejected");
+        }
     }
 
-    /// Review of 0.1.0, finding 6: the hosts the local clients use are accepted, a public domain is not
     #[test]
     fn host_allowlist() {
-        let c = Config::for_tests(std::path::Path::new("/tmp"));
+        let c = Config::for_tests();
         for host in [
             "tenant.db",
             "tenant.local",
@@ -559,59 +311,13 @@ mod tests {
     }
 
     #[test]
-    fn file_layout() {
-        let c = Config::for_tests(std::path::Path::new("/var/lib/db"));
-        assert_eq!(c.db_file("tenant"), PathBuf::from("/var/lib/db/dbs/tenant/data"));
-        assert!(c.per_namespace_dir());
-        let mut flat = c.clone();
-        flat.db_file_template = "{ns}.db".into();
-        assert!(!flat.per_namespace_dir());
-    }
-
-    #[test]
     fn version_names_the_commit() {
         let e = Config::try_parse_from(["xsqld", "--version"]).unwrap_err();
         assert_eq!(e.kind(), clap::error::ErrorKind::DisplayVersion);
         assert_eq!(e.to_string(), format!("xsqld {VERSION} ({COMMIT})\n"));
-        assert!(!COMMIT.is_empty());
+        assert!(!COMMIT.trim().is_empty());
     }
 
-    #[test]
-    fn read_pool_follows_the_cpus_but_keeps_room_for_slow_queries() {
-        let cpus = std::thread::available_parallelism().unwrap().get();
-        assert_eq!(Config::parse_from(["xsqld"]).read_pool_size, cpus.max(16));
-        assert_eq!(default_read_pool_size(), cpus.max(16));
-        assert_eq!(Config::parse_from(["xsqld", "--read-pool-size", "2"]).read_pool_size, 2);
-    }
-
-    #[test]
-    fn htap_settings_have_bounded_defaults_and_test_idle_timeout() {
-        let defaults = Config::parse_from(["xsqld"]);
-        assert_eq!(defaults.htap_memory_limit_mb, 512);
-        assert_eq!(defaults.htap_worker_idle_ms, 10_000);
-        assert_eq!(defaults.htap_worker_idle(), Duration::from_secs(10));
-
-        let configured = Config::parse_from([
-            "xsqld",
-            "--htap-memory-limit-mb",
-            "1024",
-            "--htap-worker-idle-ms",
-            "2500",
-        ]);
-        assert_eq!(configured.htap_memory_limit_mb, 1024);
-        assert_eq!(configured.htap_worker_idle(), Duration::from_millis(2500));
-
-        let tests = Config::for_tests(std::path::Path::new("/tmp"));
-        assert_eq!(tests.htap_worker_idle(), Duration::from_millis(200));
-    }
-
-    #[test]
-    fn db_path_defaults_to_sqlds_data_directory() {
-        assert_eq!(Config::parse_from(["xsqld"]).db_path, PathBuf::from("data.sqld"));
-    }
-
-    /// Review of 0.1.0: only lower bounds were checked. A negative `--max-like-pattern-bytes` kept SQLite's 50000
-    /// (set_limit ignores negative values), huge durations panicked when added to the clock
     #[test]
     fn every_numeric_flag_is_bounded_on_both_sides() {
         let ok = |args: &[&str]| {
@@ -622,10 +328,7 @@ mod tests {
                 .validate()
                 .map_err(|e| e.to_string())
         };
-        // the runtime's command line, and the defaults
         ok(&[
-            "--db-path",
-            "/var/lib/db",
             "--http-listen-addr",
             "127.0.0.1:8080",
             "--admin-listen-addr",
@@ -643,37 +346,43 @@ mod tests {
         assert_eq!(flags.len(), bounds.len(), "a flag is listed twice");
         for (flag, value, min, max) in bounds {
             assert!((min..=max).contains(&value), "default of --{flag}");
+            // keep pool_min <= pool_max valid when testing boundaries of either
+            let extra: &[&str] = match flag {
+                "pool-min" => &["--pool-max=1024"],
+                "pool-max" => &["--pool-min=0"],
+                _ => &[],
+            };
             for bad in [min - 1, max + 1] {
-                let e = ok(&[&format!("--{flag}={bad}")]).unwrap_err();
+                let mut args = vec![format!("--{flag}={bad}")];
+                args.extend(extra.iter().map(|s| (*s).to_owned()));
+                let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                let e = ok(&refs).unwrap_err();
                 assert!(
                     e.contains(&format!("--{flag}")) || e.contains("invalid value"),
                     "--{flag}={bad}: {e}"
                 );
             }
             for good in [min, max] {
-                ok(&[&format!("--{flag}={good}")]).unwrap_or_else(|e| panic!("--{flag}={good}: {e}"));
+                let mut args = vec![format!("--{flag}={good}")];
+                args.extend(extra.iter().map(|s| (*s).to_owned()));
+                let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                ok(&refs).unwrap_or_else(|e| panic!("--{flag}={good}: {e}"));
             }
         }
-        assert!(
-            ok(&["--max-like-pattern-bytes=-1"])
-                .unwrap_err()
-                .contains("must be between 1 and")
-        );
-        assert!(ok(&["--request-timeout-ms=18446744073709551615"]).is_err());
-        // every numeric flag of the command line is in the list
         let numeric = Config::command()
             .get_arguments()
             .filter(|a| a.get_action().takes_values() && !a.is_hide_set())
             .filter(|a| {
                 let id = a.get_id().as_str();
                 ![
-                    "db_path",
+                    "mysql_host",
+                    "mysql_user",
+                    "mysql_password",
+                    "mysql_url",
+                    "auth_token",
                     "http_listen_addr",
                     "admin_listen_addr",
-                    "ui_listen_addr",
-                    "db_file_template",
                     "allowed_host_suffixes",
-                    "synchronous",
                 ]
                 .contains(&id)
             })
@@ -681,47 +390,23 @@ mod tests {
         assert_eq!(numeric, bounds.len(), "a numeric flag has no bounds");
     }
 
-    /// Review of 0.1.0: `{ns}` at the end of the file name made the database `a-wal` the WAL of `a`; a database
-    /// named `xsqld-tmp` under `{ns}/data` was emptied at startup
     #[test]
-    fn templates_that_mix_up_databases_are_refused() {
-        let with = |t: &str| {
-            let mut c = Config::for_tests(std::path::Path::new("/srv/db"));
-            c.db_file_template = t.into();
-            c
-        };
-        for t in ["dbs/{ns}/data", "{ns}.db", "{ns}/data", "db-{ns}.sqlite", "{ns}-wal.db"] {
-            with(t).validate().unwrap_or_else(|e| panic!("{t}: {e}"));
-        }
-        for t in [
-            "{ns}",
-            "dbs/x-{ns}",
-            "{ns}-wal",
-            "{ns}-journal",
-            "/abs/{ns}/data",
-            "../{ns}.db",
-            "dbs/./{ns}.db",
-            "dbs/data",
-        ] {
-            assert!(with(t).validate().is_err(), "{t}");
-        }
-        let c = with("{ns}/data");
-        assert!(!c.usable_namespace("xsqld-tmp"));
-        assert!(c.usable_namespace("tenant"));
-        let sqld = with("dbs/{ns}/data");
-        assert!(
-            sqld.usable_namespace("xsqld-tmp"),
-            "sqld's layout keeps it apart from the scratch directory"
-        );
-        assert!(!sqld.usable_namespace("../x"));
-    }
-
-    #[test]
-    fn refuses_public_listen() {
-        let mut c = Config::for_tests(std::path::Path::new("/tmp"));
+    fn validates_pool_auth_and_loopback() {
+        let mut c = Config::for_tests();
         c.http_listen_addr = "0.0.0.0:8080".parse().unwrap();
         assert!(c.validate().is_err());
         c.allow_non_loopback = true;
+        assert!(c.validate().is_ok());
+
+        c.pool_min = 10;
+        c.pool_max = 5;
+        assert!(c.validate().is_err());
+        c.pool_min = 2;
+        assert!(c.validate().is_ok());
+
+        c.auth_token = Some(String::new());
+        assert!(c.validate().is_err());
+        c.auth_token = Some("secret".into());
         assert!(c.validate().is_ok());
     }
 }

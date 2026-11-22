@@ -1,364 +1,46 @@
-# xsqld
-
-A local-only SQLite database server, a drop-in replacement for the supported subset of libsql-server (sqld) 0.24.32. It speaks sqld's Hrana over HTTP (`POST /v2/pipeline`), `GET /dump` and the admin API for creating and deleting databases; underneath is stock SQLite (rusqlite `bundled`). This fork also embeds DuckDB to mirror every table of a namespace for analytics in the same Rust process, exposed through `POST /v2/analytics`; no Python runtime or separate synchronizer is required.
-
-It was written for an application runtime that reaches its databases on the same machine through sqld's HTTP API, via an adapter that presents them as Cloudflare D1. "The runtime" and "the adapter" below mean that client; what it relies on decides which sqld behaviours xsqld reproduces exactly.
-
-Version history: [CHANGELOG.md](CHANGELOG.md). License: MIT or Apache-2.0 ([LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE)).
-
-## 1. Compatibility checks against sqld
-
-Checked against the source of libsql-server **0.24.32** (tag `libsql-server-v0.24.32`, commit `40c272de`), plus the official image `ghcr.io/tursodatabase/libsql-server:v0.24.32` run locally with `--enable-namespaces --max-log-size 32`.
-
-### 1.1 Which PRAGMAs sqld sets on each connection
-
-Only two places in the source set connection parameters:
-
-| Location | What it sets |
-|---|---|
-| `libsql-sys/src/connection.rs` `Connection::open` | `journal_mode=WAL`; `sqlite3_wal_autocheckpoint(1000)` (`DEFAULT_AUTO_CHECKPOINT`); `busy_timeout(100 ms)` |
-| `libsql-server/src/connection/connection_core.rs` `CoreConnection::new` | `max_page_count` (default 1000 PB ÷ 4096, i.e. unlimited); `synchronous` = the database's `durability_mode`, default `relaxed` → `NORMAL`; `SQLITE_LIMIT_LENGTH` = `max_row_size`, default **5 MB**; a progress handler every 100 VM instructions (only used to cancel requests) |
-
-`foreign_keys` and `recursive_triggers` are not set in code and take SQLite's compile-time defaults. Values read back with `PRAGMA` at run time (`tenant` database, via `/v2/pipeline`):
-
-| PRAGMA | sqld 0.24.32 | xsqld |
-|---|---|---|
-| `foreign_keys` | **1** (compile option `SQLITE_DEFAULT_FOREIGN_KEYS`) | 1 (set explicitly on every connection) |
-| `recursive_triggers` | 0 | 0 (set explicitly) |
-| `defer_foreign_keys` | 0 | 0 |
-| `trusted_schema` | 1 | 1 |
-| `journal_mode` | wal | wal |
-| `synchronous` | 1 (NORMAL) | **2 (FULL)**, configurable (`--synchronous`): an acknowledged write survives a power cut; group commit pays for it |
-| `wal_autocheckpoint` | 1000 | **0**: the server runs checkpoints itself (§4.3) |
-| `journal_size_limit` | -1 | **64 MB** (configurable) |
-| `busy_timeout` | 100 | 100 on the write connection, 1000 on read connections: the server has a single writer and does not rely on it for retries |
-| `cache_size` | -2000 (2 MB) | -2000, configurable (`--cache-size`) |
-| `page_size` / `auto_vacuum` / `encoding` | 4096 / 0 / UTF-8 | same (database files are opened as they are, unchanged) |
-| `temp_store` / `mmap_size` / `locking_mode` | 0 / 0 / normal | same |
-| `SQLITE_LIMIT_LENGTH` | 5 MB | 5 MB, configurable (`--max-value-bytes`) |
-| `SQLITE_LIMIT_LIKE_PATTERN_LENGTH` | 50000 (SQLite's default) | **1000**, configurable (`--max-like-pattern-bytes`, at most 10000): SQLite's matcher recurses once per `%` and does not reach the progress handler, so a 40 KB pattern overflows a thread's stack (the process dies, sqld included) and a long one runs for minutes past every deadline |
-| `SQLITE_LIMIT_ATTACHED` | 10 (but ATTACH is not allowed by default) | 0: no ATTACH |
-| SQLite version | 3.45.1 | 3.54.1 (rusqlite 0.41 `bundled`) |
-
-Conclusion: the two settings that change foreign key and trigger behaviour (`foreign_keys=1`, `recursive_triggers=0`) are the same in xsqld and sqld; the only intentional differences are `synchronous`, `wal_autocheckpoint`, `journal_size_limit` and the LIKE pattern limit.
-
-### 1.2 Where database files live with namespaces enabled
-
-Source: every `namespace/configurator/*.rs` uses `base_path.join("dbs").join(<name>)`, and the database file is `data` inside it (`open_conn_active_checkpoint` in `connection/legacy.rs`: `path.join("data")`). Directory after creating the `platform` and `tenant` databases with `--db-path /db/data`:
-
-```
-<db-path>/.version                     sqld data directory version
-<db-path>/metastore/data(-wal,-shm)    sqld's own metadata database (per-database configuration)
-<db-path>/dbs/<name>/data              ← the database file (plain SQLite, WAL mode)
-<db-path>/dbs/<name>/data-wal
-<db-path>/dbs/<name>/data-shm
-<db-path>/dbs/<name>/wallog            sqld's replication log (unused by xsqld)
-<db-path>/dbs/<name>/.sentinel         sqld "running" marker: present at startup → the log is considered dirty and is recovered from the database file
-<db-path>/dbs/<name>/stats.json, tmp/, to_compact/   used by sqld only
-```
-
-With `--db-path /srv/db`, for example, the database `tenant` is the file `/srv/db/dbs/tenant/data`.
-
-By default xsqld finds databases by the same rule (`--db-file-template 'dbs/{ns}/data'`, relative to `--db-path`) and opens these files directly: switching moves no data. Files that only sqld uses, such as `metastore/` and `wallog`, are neither read nor changed.
-
-**What rolling back to sqld relies on**: if a database directory contains `.sentinel` at startup, or has no `wallog`, sqld first checkpoints and then rebuilds the replication log from the database file (`ReplicationLogger::open` → `recover` in `replication/primary/logger.rs`); it never lays an old `wallog` over data that xsqld wrote. So when xsqld opens a database without `.sentinel` it creates one and never removes it, and on a clean shutdown it runs a `TRUNCATE` checkpoint so that the database file is self-contained. Rollback drill: §5.
-
-## 2. Interface (shared with sqld)
-
-Two ports, by default 127.0.0.1:8080 (clients) and 127.0.0.1:8081 (admin). Only loopback addresses are accepted; any other address needs `--allow-non-loopback`. The database name is the first label of the `Host` header (`<name>.db`, as the runtime sends it).
-
-xsqld has no authentication and serves local processes only, so a web page open on the same machine must not reach it. Two checks on every request, on both ports, answer 403 before anything runs:
-
-- The `Host` header must be an IP address, a name without a dot (`localhost`, `sqld-admin`) or a name under one of `--allowed-host-suffixes` (default `db,local,localhost`; `*` accepts every host). After DNS rebinding a page talks to xsqld as its own origin and its requests look like any local client's, except for the Host, which is the page's domain. Deployments that reach xsqld under another domain add its suffix.
-- Requests with an `Origin` or `Sec-Fetch-Site` header are refused: browsers add them to the cross-site requests a page can send to a local name, including a `text/plain` POST that needs no preflight. Local clients send neither (`Sec-Fetch-Mode` alone is not a sign of a browser: Node's `fetch` sends it).
-
-What this does not cover: someone who controls name resolution on the local network (answering for a `.local` name or a bare host name) can still rebind such a name; drop `local` from the suffixes where that matters.
-
-| Port | Endpoint | Description |
-|---|---|---|
-| 8080 | `POST /v2/pipeline` | Hrana over HTTP v2 `execute`, `batch` and `close`; streams continue with batons |
-| 8080 | `GET /dump` | Whole-database export as SQL text, byte-identical to sqld 0.24.32 (except non-UTF-8 text, see §4) |
-| both | `GET /health`, `GET /metrics` | Health check, returning `{"version", "commit"}` (sqld returns an empty body; clients only look at the status); metrics in Prometheus text format, including `xsqld_build_info{version,commit}` |
-| 8081 | `POST /v1/namespaces/<name>/create` | Create a database; the body may carry `dump_url` to create it from a dump (loopback addresses only by default) |
-| 8081 | `DELETE /v1/namespaces/<name>` | Delete a database |
-
-Not implemented: Hrana v3 and WebSocket, `sequence` / `describe` / `store_sql` (unused by the runtime; such requests and statements with `sql_id` get 400), replication, authentication (local clients only). `--enable-namespaces` and `--max-log-size` are accepted and ignored, so sqld's command line can be reused as it is. `xsqld --version` prints `xsqld <version> (<short commit>)`.
-
-### 2.1 Flags
-
-sqld's own flags keep sqld's names and defaults: `--db-path` (`data.sqld`), `--http-listen-addr` (`127.0.0.1:8080`), `--admin-listen-addr` (`127.0.0.1:8081`; on by default, unlike sqld), `--enable-namespaces` and `--max-log-size` (ignored). The defaults of all other flags are chosen so that sqld's command line needs nothing added. Every numeric flag has a range; a value outside it stops the server at startup with a message naming the flag (SQLite ignores a negative limit and keeps its own default, and a huge duration would overflow the clock).
-
-| Flag | Default | Range | Meaning |
-|---|---|---|---|
-| `--db-file-template` | `dbs/{ns}/data` | relative, below `--db-path`, no `.` / `..`; the file name must not end in `{ns}` | Database file of a database (§1.2). A file name ending in `{ns}` would make the database `a-wal` the WAL of `a` |
-| `--allow-non-loopback`, `--allow-remote-dump-url` | off | | Listen on, and fetch `dump_url` from, addresses other than loopback |
-| `--allowed-host-suffixes` | `db,local,localhost` | | Host suffixes accepted besides IP addresses and names without a dot (§2); `*` accepts every Host |
-| `--synchronous` | `full` | off, normal, full, extra | PRAGMA synchronous of the write connection (§1.1) |
-| `--cache-size` | -2000 | ±2³⁰ | PRAGMA cache_size of every connection |
-| `--read-pool-size` | CPUs, at least 16 | 1–1024 | Read connections per database (§3) |
-| `--group-max` | 64 | 1–65536 | Most requests committed together in one group |
-| `--group-linger-us` | 0 | 0–1 s | How long the write thread waits for more work before committing |
-| `--group-max-exec-ms` | 20 | 0–60 s | A group running this long is committed before its next request |
-| `--max-write-queue` | 4096 | 1–10⁶ | Write requests waiting per database; more get 503 |
-| `--queue-timeout-ms` | 40000 | 0–1 h | Longest wait in the write queue |
-| `--request-timeout-ms` | 40000 | 1 ms–1 h | Time limit of one HTTP request, queueing included |
-| `--stream-idle-ms` | 10000 | 1 ms–24 h | A stream (baton) unused this long expires |
-| `--pinned-tx-timeout-ms` | 5000 | 1 ms–1 h | A transaction left open across requests is rolled back after this |
-| `--checkpoint-pages` | 1000 | 1–10⁶ | WAL frames that wake the checkpoint thread (§3) |
-| `--checkpoint-restart-bytes` | 32 MiB | 4 KiB–1 TiB | WAL size at which the write thread runs RESTART |
-| `--checkpoint-reader-wait-ms` | 200 | 0–60 s | After a failed RESTART, how long the next one, with new reads held back, waits for the reads running (§3) |
-| `--checkpoint-idle-ms` | 1000 | 0–1 h (0: off) | Idle time after which the write thread checkpoints |
-| `--max-worker-threads` | 256 | 1–65536 | Most threads running writes and checkpoints at once, for all databases together (§3) |
-| `--idle-close-ms` | 300000 | 0–24 h (0: off) | A database no request has used for this long is closed; the next request opens it again (§3) |
-| `--journal-size-limit` | 64 MiB | -1–1 TiB | PRAGMA journal_size_limit of the write connection |
-| `--max-request-bytes` | 16 MiB | 1 KiB–1 GiB | Largest request body |
-| `--max-connections` | 1024 | 1–10⁶ | Open connections per port |
-| `--max-concurrent-requests` | 512 | 1–10⁶ | Requests handled at once per port; more get 503 |
-| `--header-read-timeout-ms` | 10000 | 1 ms–1 h | A request head must arrive within this (also ends idle connections) |
-| `--body-read-timeout-ms` | 10000 | 1 ms–1 h | A request body must arrive within this; 408 otherwise |
-| `--response-write-timeout-ms` | 60000 | 1 ms–1 h | A response the client takes no data of for this long is abandoned and the connection closed |
-| `--dump-stall-timeout-ms` | 60000 | 1 ms–24 h | `GET /dump`: longest pause of the client |
-| `--dump-max-ms` | 3600000 | 0–7 d | `GET /dump`: longest dump |
-| `--max-concurrent-dumps` | 2 | 1–1024 | `GET /dump` running at once |
-| `--dump-url-timeout-ms` | 1800000 | 1 ms–7 d | `dump_url`: longest download |
-| `--dump-load-max-statement-bytes` | 128 MiB | 1 KiB–1 GiB | Creating from a dump: longest statement (a longer line is refused before it is read in whole) |
-| `--dump-load-timeout-ms` | 1800000 | 1 ms–7 d | Creating from a dump: longest load, download included; SQL still running then is interrupted |
-| `--max-statements` | 4096 | 1–10⁶ | Statements in one HTTP request |
-| `--max-response-bytes` | 64 MiB | 1 KiB–16 GiB | Largest result of one HTTP request (RESPONSE_TOO_LARGE) |
-| `--max-value-bytes` | 5 MiB | 1–10⁹ | SQLITE_LIMIT_LENGTH (sqld's `max_row_size`) |
-| `--max-like-pattern-bytes` | 1000 | 1–10000 | SQLITE_LIMIT_LIKE_PATTERN_LENGTH (§1.1) |
-| `--parallel-max-ranges` | 4 | 2–64 | Split aggregates (§3.1): most rowid ranges, each on a read connection of its own, one statement runs on (never more than the CPUs) |
-| `--parallel-min-rows` | 1000000 | 1000–2⁵⁰ | Split aggregates: tables with fewer rows than this run on one connection (estimated from the rowid b-tree, §3.1) |
-| `--parallel-pool-percent` | 50 | 10–90 | Split aggregates: share of `--read-pool-size` the additional connections of all split statements of a database may hold together |
-| `--parallel-max-partial-rows` | 1000000 | 1000–10⁸ | Split aggregates: most partial rows (groups times ranges) one statement may collect; past this it runs on one connection |
-| `--htap-memory-limit-mb` | 512 | 16–1048576 | DuckDB managed-memory limit per active namespace (not an RSS limit) |
-| `--htap-worker-idle-ms` | 10000 | 100–3600000 | How long the HTAP sync worker holds a shared-pool worker while idle |
-| `--ui-listen-addr` | off | loopback only | Web console at `/ui` (§2.3); startup prints its token URL |
-| `--route-enabled` | off | | Answer equivalent SELECTs from the mirror (§2.4) |
-| `--route-min-rows` | 200000 | 1000–2⁵⁰ | Single-table SELECTs are routed only above this many estimated rows |
-
-### 2.2 Embedded analytics
-
-`POST /v2/analytics` selects the namespace through the same Host header as `/v2/pipeline`. Its JSON body is `{"sql":"SELECT status, SUM(amount_cents) FROM orders_native GROUP BY status","args":[]}`; positional arguments use the Hrana value encoding. The response contains `watermark` and a Hrana-style statement `result`.
-
-The first analytics request installs persistent capture for every ordinary table of the namespace and creates `<database-file>.duckdb`. Each table `t` is mirrored as the view `t_native` over a columnar table keyed by its primary key (or rowid); every mirrored column is a DuckDB `VARIANT`, so a SQLite column keeps the type each value actually has. The initial data and watermark come from one SQLite read transaction. Committed writes wake a Rust worker, which streams the committed changelog into a DuckDB appender and applies the batch and its watermark in one transaction. A batch includes an entire source snapshot rather than splitting a source transaction. Pruning runs on the existing SQLite write thread, after the DuckDB commit, and preserves a durable source position. A missing mirror, a mirror from a different source generation, or a restored mirror older than the retained changelog is rebuilt from SQLite. Opening a previously enabled namespace after restart resumes its Rust worker automatically. The old external Python mirror file is not used.
-
-Analytics waits for the source position observed when the request begins. Queries use separate connections to the same DuckDB instance, so analysis and synchronization coexist in one process. Only one SELECT/CTE query is accepted; writes, multiple statements, external file/network access and extension autoloading are disabled. The normal request deadline and response size limit apply. Results use the Hrana scalar types: a mirrored column's value comes back as the SQLite type it holds (integer, float, text, blob or null), while DuckDB's own DECIMAL results and integers outside signed 64-bit range are returned as text, and other DuckDB-specific types must be cast to VARCHAR. DuckDB's managed-memory limit is configurable with `--htap-memory-limit-mb` (512 MiB by default) per active namespace, and worker threads are released after `--htap-worker-idle-ms` (10 seconds by default); the memory limit is not a process RSS limit.
-
-All tables are followed by default, including tables created after the capture was installed. `CREATE TABLE`, `ALTER TABLE` and `DROP TABLE` refresh the capture inside the statement's own transaction and rotate the source generation, so the mirror is rebuilt from SQLite and no change is missed; a renamed table is mirrored under its new name and a dropped table's view disappears. **Only the tables whose own shape changed are rebuilt**; the others keep their position and continue from the changelog, so adding a small table to a large database no longer re-mirrors the large ones. Each table's shape and position live in the mirror's catalog (`xsqld_tables.fingerprint`, `.watermark`), added to older mirrors without invalidating them: a mirror that predates those columns is adopted as it stands when its recorded schema still matches, and rebuilt once otherwise. The mirror's reported `watermark` is the oldest position among its tables, and the changelog is pruned only up to that, so a table that is behind never loses the rows it still needs. A new table is snapshotted even when the mirror was already caught up. Budget for a snapshot of the table that changed, and keep `--request-timeout-ms` above the time that takes (the sync uses the same timeout for its rebuilds). Composite and `WITHOUT ROWID` primary keys are supported. Virtual tables are left out, as SQLite allows no triggers on them, and so are `sqlite_` tables and virtual-table shadow tables. `xsqld_changelog`, `xsqld_htap_meta` and the capture triggers `xsqld_capture_<hash>_{i,u,d}` are reserved: naming them in client SQL, writing `sqlite_sequence` directly, or installing client triggers on internal tables is refused. SQLite's own bookkeeping for a client's `ALTER TABLE`/`DROP TABLE` (dropping the table's capture triggers, maintaining its `sqlite_sequence` row) is allowed only while that statement runs. Ordinary inserts, updates (including primary-key changes) and deletes continue through `/v2/pipeline`; an update that leaves the key alone is one changelog row. Namespace deletion closes the worker and analytical connections before removing the mirror files. See [the embedded HTAP guide](htap-p0/README.md) for a complete example; historical Python prototype measurements are not benchmarks of this implementation.
-
-The capture's reads pass the database's read gate like any other read (§3), so a checkpoint that must restart the WAL waits for them instead of failing behind them. A commit both signals the sync and starts its worker when the worker had gone idle, so the mirror keeps up without an analytical query to prompt it. `GET /dump` leaves the capture's own tables, triggers and sequence rows out: they are not the database's data, and carrying them would let a database rebuilt from the dump claim the source identity of the one it was copied from.
-
-`GET /metrics` reports, per namespace and only while the capture is installed: `htap_watermark` and `htap_source_position` with `htap_lag` (their difference, never negative), `htap_batches_total`, `htap_rows_applied_total`, `htap_rebuilds_total`, `htap_sync_errors_total`, `htap_queries_total`, and the `htap_apply` / `htap_query` timers. The watermark and source position move when the sync runs a batch or a query reads the position, so between those the lag is the last known one rather than a fresh reading of the source. The capture's waits at the read gate are counted in the shared `read_gate_wait` timer.
-
-### 2.3 Web console
-
-`--ui-listen-addr <addr>` serves a monitoring and SQL console at `/ui`. It is **off by default**, binds **loopback only** (refused at startup otherwise, even with `--allow-non-loopback`), and every request must carry the token printed once at startup:
-
-```
-INFO xsqld: web console url=http://127.0.0.1:8090/ui?t=<32 hex characters>
-```
-
-The Hrana and admin ports keep refusing every request that carries `Origin` or `Sec-Fetch-Site` (§2), so the console is the only surface a browser reaches. Its own guard refuses a wrong or missing token and any `Sec-Fetch-Site` other than `same-origin`/`none`, and it answers no CORS preflight — a page on another origin can neither read the token nor send the custom header that carries it. The page is one embedded HTML file (`ui/index.html`): no build step, no npm, no external asset, so the server stays a single binary.
-
-Five views, all read from the running server:
-
-- **概览** — version, uptime, namespace list with the size of every file (`data`, `-wal`, `-shm`, the DuckDB mirror and its WAL), worker pool, streams, and the global and per-namespace metrics.
-- **参数** — every configuration flag with its current value beside its default, and a filter for the ones that differ. The defaults come from parsing an empty command line, so they cannot drift from the flags themselves.
-- **结构** — the readable PRAGMAs, tables with their kind and mirror view, per-table row counts on demand, and the `CREATE` text of every table, index and trigger.
-- **SQL 工作台** — run one statement against SQLite (the row store) or DuckDB (the `*_native` mirror), with the result grid, round-trip and engine time, rows read/written, `last_insert_rowid`, and the mirror's `watermark`. Ctrl/Cmd+Enter runs it; history is kept in the browser.
-- **指标趋势** — sparklines from a ring buffer of the last 600 samples (one every 2 s, 20 minutes), kept in the process so a page opened later still shows the history.
-
-SQL goes through the same handlers as a client, with the namespace placed in a Host header the console builds itself (a browser cannot set one). Deadlines, `--max-response-bytes`, the authorizer and the slow-request log therefore apply unchanged: writes and DDL are allowed, `xsqld_changelog`, `xsqld_htap_meta`, the capture triggers and `sqlite_sequence` stay refused, and the mirror stays read-only.
-
-### 2.4 Transparent row/column routing
-
-`--route-enabled` lets `POST /v2/pipeline` answer a SELECT from the DuckDB mirror without the client choosing an engine or writing `t_native`. **Off by default.** It only applies to a namespace whose mirror already exists (built by a `/v2/analytics` request); the router never installs one.
-
-The rule is **route only when the two engines provably agree**. `tests/diff_engines.py` runs the same SQL on both and compares values with their types; `tests/fixtures/engine-verdicts.json` records the outcome, and every refusal in `src/route.rs` corresponds to a divergence measured there:
-
-- `CAST(AVG(v) AS BIGINT)` on an average of 1.5 gives 1 on SQLite and 2 on DuckDB, so no CAST, no AVG and no arithmetic of any kind (integer `/` gives 5 vs 5.0)
-- `MIN`/`MAX` over a column holding several storage classes orders them differently, so a column must be uniform apart from NULLs. The mirror records the storage classes each column ever held (`xsqld_tables.purity`); a column that ever held a real or a blob is refused, and text that is not UTF-8 lands in the mirror as a blob and so reads as mixed
-- `GROUP BY`/`ORDER BY` on a NOCASE or RTRIM column groups and sorts differently, so only BINARY columns are admitted
-- `ORDER BY x ASC` puts NULLs first on SQLite and last on DuckDB, so the rewriter states `NULLS FIRST`/`NULLS LAST` explicitly — the harness confirms that stating them makes the two agree
-- `SUM` past i64 raises an overflow error on SQLite, while the mirror's VARIANT sum **wraps silently to a negative number still inside i64** (measured). No runtime type check can see that, so **SUM is not routed at all** until the mirror stores native integer columns
-
-Admitted: one SELECT over inner/cross joins on plain column equality, projections of plain columns and `COUNT`/`MIN`/`MAX`, `GROUP BY` plain columns, `WHERE` comparing a column to a constant, `ORDER BY` plain columns, and `LIMIT` only when the order includes a primary key. Everything else — `SUM`, DISTINCT, UNION, subqueries, CTEs, window functions, outer joins, `HAVING`, functions, arithmetic — stays on SQLite.
-
-Equivalence alone is not enough: the mirror costs about 0.1 s per query in fixed overhead, so on a small database it is *slower*. A benefit gate therefore also requires the driving access path to be a full `SCAN` (a selective `SEARCH` stays on the row store), and a single-table query needs at least `--route-min-rows` (200000) estimated rows. A join's inner primary-key lookups are not held against it.
-
-Freshness is checked live on every request, never cached: every table the query touches must hold a watermark at or past the source position, so a routed read cannot miss a committed write. Transactions and multi-statement batches never reach the router. The decision runs under the read gate but the mirror read runs outside it, so a long analytical query cannot hold up a checkpoint. `cols[].decltype` is filled from the source schema, since the mirror has none of its own. Any mirror failure falls back to SQLite, whose error is the authoritative one.
-
-`GET /metrics` reports `route_runs_total` and `route_refused_total{reason=…}` per namespace (`not_ready`, `lagging`, `shape`, `not_equivalent`, `impure`, `selective`, `small`), so it is visible why a query did not route; the reason is also logged at debug level. The structural decision is cached by statement text against `PRAGMA schema_version`; freshness and column purity are checked live on every request, because neither is expressed by the schema version. `tests/compare_routing.py` is the acceptance test: the same requests against a server with routing on and off must match field by field, and it fails as vacuous if routing never fired.
-
-Measured on 892737 rows (release build, same machine, identical data, client unchanged): join+MIN/MAX+GROUP BY 3.8x, join+COUNT+GROUP BY 3.0x, three-table join 2.6x; refused queries show no regression (SUM 0.99x, AVG 0.96x). `tests/compare_routing.py` passes 15/15 with routing actually firing, including an overflowing SUM that both sides refuse identically.
-
-## 3. Internals
-
-- Threads follow the work, not the number of databases. Each database has one writer, the only one, so clients never get "busy"; it is state that runs on a worker thread of a pool shared by all databases while its queue has work, and gives the worker back when the queue is empty ("the write thread" below is whichever worker runs it; one at a time per database). Its checkpoints ("the checkpoint thread") are tasks on the same pool. What a writer does without a request arriving (the idle checkpoint, the end of a transaction left open, queued requests running out of time) a timer wakes it for. A timer that fires looks first at whether its time still stands: requests that ran since have moved the idle checkpoint, and the timer then sets itself again without taking a worker. The pool starts a thread for a task that finds no worker waiting, up to `--max-worker-threads` (256), and ends workers that had nothing to do for 10 s (a task goes to the worker that began waiting last, so work that a few threads can do leaves the others idle and they end); a task may block (a commit's flush), it only holds its own thread. At the limit tasks take turns: when thousands of databases stop being written to in the same second, their idle checkpoints fall due together (1905 threads at once in a test with 3500 databases before the limit). An open database without work holds no thread: 3500 databases written to in turn used to be 7009 threads (two per database for as long as it was open).
-- A database no request has used for `--idle-close-ms` (5 minutes) is closed: the writer stops (rolling nothing back: a database with a transaction left open, with queued work or held by a request is not closed), the WAL is checkpointed into the database file (TRUNCATE, as on shutdown) and all its connections are closed, so it holds no memory and no file descriptors. The next request opens it again, which takes about as long as the first request after a start. The close runs under the database's lock: a request arriving meanwhile waits for it and then gets the reopened database. Per-database metrics start from zero when a database is reopened.
-- Write requests queue up; the write thread takes up to `--group-max` of them at a time and runs them one after another in a single transaction (one SAVEPOINT per request; a client's `BEGIN` / `COMMIT` / `ROLLBACK` become creating, releasing and rolling back that inner SAVEPOINT). The whole group commits once with one fsync, and replies go out only after the commit (group commit). A failing request rolls back only itself; when SQLite rolls back the whole transaction (`ON CONFLICT ROLLBACK`, interrupt, I/O error), the group is redone without the request that caused it. Redoing is only right when nothing of the group was committed, so nothing but the write thread may commit the group transaction: transaction keywords are recognized behind everything SQLite skips in front of them (comments, a byte order mark, whitespace), and a commit hook on the write connection turns any other COMMIT inside a group into a rollback.
-- When a group has run for `--group-max-exec-ms` (20 ms) and still has requests left, the finished ones are committed and answered first and the rest go back to the head of the queue: one slow write does not hold up the replies of every request before it in the group.
-- Run on their own, outside groups: PRAGMA, SAVEPOINT, VACUUM and the like, and transactions left open across HTTP requests. The latter pin the write thread to that stream; past `--pinned-tx-timeout-ms`, or when the client goes away, the transaction is rolled back, so the write lock is never left without an owner. Requests of other streams queued meanwhile are still answered when their own queue timeout or deadline runs out (503 / 504, not run).
-- Deferred foreign keys (`DEFERRABLE INITIALLY DEFERRED`) are checked where sqld checks them: at the commit of each statement run outside a transaction, and at the client's `COMMIT`. Inside the group both of these are no commits, so a request that leaves a violation unresolved at such a point is withdrawn (its savepoint rolled back) and run again on its own, where SQLite checks it exactly there; left in the group, a later statement or request could supply the missing parent row and the outer `COMMIT` would pass. The runtime's schema has no `DEFERRABLE`; this is only a safety net.
-- A write whose `RETURNING` rows exceed `--max-response-bytes` is undone (the write runs inside a savepoint of its own, which only writes that return rows pay for), so that its `RESPONSE_TOO_LARGE` means nothing was written; sqld reports the same error but keeps the write, and a client retrying it wrote twice. Like sqld, `RESPONSE_TOO_LARGE` inside a batch fails the batch as a whole and the steps after it do not run.
-- At most `--max-write-queue` (4096) write requests per database; when full, requests get 503 without running. Requests of the stream that pins the writer are still let in (the queue is waiting for that stream).
-- Read-only statements (`sqlite3_stmt_readonly`) use the database's `--read-pool-size` read-only connections and skip the write queue. When the pool is full, reads of that database wait, so the pool must be larger than the number of slow queries running at the same time. The default is the number of CPUs (as the process sees them, cgroup quotas included), at least 16: more connections than CPUs add no throughput, but on small machines a pool of 2–4 lets two or three slow reports hold up every quick read.
-- Writes are not spread over several threads per database: SQLite admits one writer per database at a time, so a second write thread would only take turns with the first for the write lock while splitting the queue into smaller groups, i.e. more fsyncs for the same work. Concurrency on the write side comes from the clients; the write thread batches it.
-- All streams share one write connection (sqld gives each stream a connection of its own), so statements that would change connection state are refused when they are prepared (SQLite authorizer): assigning PRAGMAs (except `defer_foreign_keys`, which resets itself at the end of each transaction, and is reset by xsqld after a request that set it outside a transaction, so that it cannot reach another stream's transaction; and `user_version`, which is stored in the database file header), creating temporary tables, indexes, views, triggers and virtual tables (`CREATE TEMP …` and `CREATE … temp.name` alike: a temporary trigger on a real table would run for every other client's writes, a temporary view would stand in front of the real table), and `load_extension()`. Reading PRAGMAs (`PRAGMA foreign_keys`, `PRAGMA table_info(t)`, `pragma_table_info()` and so on) works as usual. sqld's parser refuses these statements too (tested; except `foreign_keys = …` and views and triggers named `temp.…`), and xsqld returns the same error: `SQL_PARSE_ERROR`, `SQL string could not be parsed: unsupported statement: <statement>`; one such statement in a batch stops the whole batch from running. `VACUUM` / `VACUUM INTO` get the same error (as with sqld; with no attachable databases it could not run anyway). The runtime only uses `defer_foreign_keys` and the reading forms.
-- HTTP limits: at most `--max-connections` (1024) connections per port, further ones wait in the listen backlog; at most `--max-concurrent-requests` (512) requests handled at once, more get 503 immediately (`/health` is not counted, so that a watchdog does not mistake busy for dead); the request head must arrive within `--header-read-timeout-ms` (10 s), which also closes idle keep-alive connections; the request body must arrive within `--body-read-timeout-ms` (10 s), or the reply is 408; a response the client takes no data of for `--response-write-timeout-ms` (60 s) is abandoned and its connection closed, so clients that send requests and never read the answers cannot hold every connection slot. That limit is on a stall, not on the whole response: a client that reads slowly but steadily is served. A request's time limit counts from the moment its head was received.
-- `GET /dump` first copies the database to `--db-path/xsqld-tmp/` with SQLite's online backup (one read transaction, as fast as copying the file), then writes the SQL text from the copy, so a slow client does not hold back checkpoints of the live database; the copy is removed afterwards (and the directory is emptied at startup). If the client takes no data for `--dump-stall-timeout-ms` (60 s), or the whole dump takes longer than `--dump-max-ms` (1 hour), the dump is abandoned and the response body ends with an error rather than the normal ending. The cost is disk space for one extra copy of the database while a dump runs; at most `--max-concurrent-dumps` (2) dumps run at once, more get 503.
-- Creating, deleting and first opening a database take a per-database lock, so building one database from a dump does not block the others. The lock goes with the blocking work: a first open whose request is cancelled still finishes and registers the database before a `DELETE` of it can start (before, the open went on unlocked and could create the deleted file again). Besides the limit between two chunks (60 s), a `dump_url` download as a whole is limited by `--dump-url-timeout-ms` (30 minutes), and only a download that reached its proper end is loaded: when the create request is abandoned or the download breaks off, nothing is created, also when what had arrived ends between two statements. Loading a dump is limited too: no statement longer than `--dump-load-max-statement-bytes` (128 MiB; a longer line is refused before it is read in whole), and no more than `--dump-load-timeout-ms` (30 minutes) in all, after which SQL still running is interrupted; either way the create fails with 400 and leaves nothing. Statement ends are found reading each statement once, however many of its lines end in `;`. The database name is checked (valid, not taken) before `dump_url` is fetched, so a one-time token is not used up by a create that cannot succeed. URLs in the log keep only scheme, host and port (tokens are masked whether they are in the path or the query string; a user name and password are masked too, control characters escaped); a URL with a control character or space is refused.
-- A new database never takes over files of an old one: when it is created, `-wal`, `-shm` and `-journal` files under its name (left by a crash while a database of that name was being deleted, after its main file was gone) are removed first. SQLite checks WAL frames against the WAL's own header, not against the database file, so the new database would otherwise show the old content. At startup the same leftovers are removed for every database the template finds, along with the files of builds from a dump that did not finish (`*.xsqld-loading*`).
-- Each connection keeps up to 256 compiled statements for reuse. Statements longer than 8 KB are compiled for one use and not kept: those carry their values inline and do not repeat, and a compiled statement takes several times its text in memory (256 different 4 MB statements used to grow the server by gigabytes).
-- Memory for Rust and SQLite comes from mimalloc (SQLite through `SQLITE_CONFIG_MALLOC`, set at startup before the first connection). Reason: xsqld is meant to be built as a static musl binary, and musl's own allocator only grew under the soak load. The same load for 5 minutes in a Linux container: musl's allocator 16 → 791 MB, glibc's allocator 15 → 27 MB; with mimalloc the musl build went 42 → 62 MB and stayed flat from the 4th minute, with about 40% more write and read throughput.
-- A panic on any thread ends the process at once (`abort`) and the service manager restarts it. No process is left behind that answers reads and `/health` but refuses every write of a database with 503. Under systemd use `Restart=always`, and a `TimeoutStopSec` longer than the drain on SIGTERM (in-flight requests get up to `--request-timeout-ms` plus 5 s, then the TRUNCATE checkpoint runs): 60 s with the defaults. A shorter timeout loses no data, the WAL is replayed at the next start.
-- Streams (batons) hold no connection: a baton carries only the stream number, a sequence number and random bytes; an expired or reused baton gets 400, as with sqld.
-- The server runs checkpoints itself (`wal_autocheckpoint=0`). When the WAL reaches `--checkpoint-pages` frames, the database's checkpoint thread is woken and runs a PASSIVE checkpoint on its own connection, without stopping writes. When the background checkpoint cannot catch up with a WAL that keeps being written, the write thread copies the remaining tail (no more than `--checkpoint-pages` frames) itself between groups, so that the WAL can start over from the beginning. When the WAL holds more than `--checkpoint-restart-bytes` (32 MB) the write thread runs RESTART, and after `--checkpoint-idle-ms` of idleness it runs PASSIVE. Once `--checkpoint-pages` frames have been written since the checkpoint thread was woken, the next group waits for that run to end (`checkpoint_wait` in the metrics): on a disk with slow random writes the checkpoint thread otherwise falls further and further behind, and the RESTART that copies what it left stops all writes for hundreds of milliseconds (§5.4). The time of every kind of checkpoint goes into the metrics; a group commit slower than 100 ms logs a `slow commit` line (time and number of requests in the group), so slow writes can be traced to the disk flush.
-  - Why a separate checkpoint thread: with the write thread running PASSIVE between groups itself, it spent more than half its time on checkpoints (4025 in 60 s, 55 s in total, longest 276 ms) and every write queued behind them; with the background thread, see §5.4.
-  - Checkpoint starvation: SQLite starts the WAL over only once no read transaction uses it, so read requests following each other closely while writes go on always leave a reader on the WAL; RESTART, which waits 20 ms for readers, never found a gap, and the WAL grew for as long as the pattern lasted (619 MB in 8 s in a review test). After a RESTART fails, the next one (`--checkpoint-pages` frames later) closes the database's read gate: new read requests (and dump snapshots) wait, the write thread waits up to `--checkpoint-reader-wait-ms` (200 ms) for the reads already running to end, runs RESTART and opens the gate again. Reads that start once every frame is in the database file do not use the WAL, so the WAL starts over. Bounds: the gate is closed for at most that wait plus one RESTART, only after a failed RESTART, and after a closed-gate RESTART that still failed it stays open for at least four times the wait; a read waits at most once per try and never past its own deadline; nothing a read does is refused. Invariant: as long as the reads running when the gate closes end within the wait, the WAL starts over within two RESTART attempts of passing `--checkpoint-restart-bytes`, however closely reads follow each other. The time the gate was closed and the time reads waited are in the metrics (`checkpoint_gate`, `read_gate_wait`). The normal path is unchanged: no gate while RESTARTs succeed.
-  - With nothing to checkpoint, an idle write thread sleeps until the next request; `--checkpoint-idle-ms 0` turns the idle checkpoint off (it used to make the thread spin).
-- The WAL file is truncated only on a clean shutdown, never while running. The reason is the cost of flushing: with `synchronous=FULL` every group commit flushes once, and when WAL frames are written to blocks that are already allocated, `fdatasync` does not wait for a file system journal commit; while the WAL file is still growing it waits every time. After a checkpoint the next write overwrites the WAL from the beginning and the file keeps its size (bounded by `journal_size_limit`). Numbers: §5.6.
-- The bundled SQLite must be compiled with `-DHAVE_FDATASYNC=1` (`LIBSQLITE3_FLAGS` in `.cargo/config.toml`). rusqlite's `bundled` does not add it, and SQLite on Linux then uses `fsync`, paying one extra file system journal commit per commit. That file only applies when cargo is run inside this directory, so `build.rs` fails the build for Linux targets that lack the flag; the `sqlite_flags` field of the startup log shows the flags actually used.
-- Every request has a time limit (`--request-timeout-ms`, queueing plus execution); SQL still running at the deadline is interrupted (progress handler), so read transactions cannot hold back checkpoints forever either.
-- When a database is opened without `.sentinel`, one is created (the file and its directory entry are synced) and never removed, and a clean shutdown runs a TRUNCATE checkpoint: on rollback to sqld it rebuilds its replication log from the database file (§1.2).
-- With a template that puts databases in directories of their own at the top of `--db-path` (such as `{ns}/data`), the name `xsqld-tmp` would be the server's scratch directory, emptied at every start: it is refused as a database name (400 on create and delete, 404 for requests). sqld's layout `dbs/{ns}/data` is not affected.
-- `build.rs` embeds the git commit (`git rev-parse --short HEAD`; the environment variable `XSQLD_GIT_COMMIT` overrides it for builds outside a git checkout; `unknown` without either). The startup log shows version, commit, write threads per database (always 1) and read connections per database.
-
-### 3.1 Split-range parallel aggregation
-
-SQLite runs one statement on one CPU core, so a `COUNT` or `GROUP BY` over tens of millions of rows takes seconds however many cores the machine has. xsqld runs such a statement on several read connections at once, each on a range of rowids, all on one snapshot of the database, and lets SQLite combine the partial results. On a 100-million-row table (Apple M4 Max, 4 ranges): a filtered `COUNT(*)` 3.3 s → 1.2 s, a `GROUP BY` of 60 groups 22 s → 5.8 s ([docs/parallel-aggregate.md](docs/parallel-aggregate.md), with the measurements and their method).
-
-It is always on and has no switch. A statement is split only when the result is certain to be the one a single connection returns, byte for byte: column names and declared types (taken from the original statement), values and their types, row order, errors such as `integer overflow`, `RESPONSE_TOO_LARGE` and the deadline. Every other statement runs exactly as before; for statements that are not of the shape below the only cost is reading their text once more (a few microseconds), and for statements of the shape on small tables two lookups at the ends of the table's rowid b-tree (plus, once every 10 seconds per table, an estimate of its rows when its rowids are sparse).
-
-**The shape** (all of it must hold; whatever is not certain counts as not the shape):
-
-- One `SELECT item, … FROM table [[AS] alias] [WHERE …] [GROUP BY column, …] [HAVING …] [ORDER BY …] [LIMIT … [OFFSET …]]`, run outside a client transaction (statements between a client's `BEGIN` and `COMMIT` see the transaction's snapshot and are never split).
-- Items: grouping columns (each one a `GROUP BY` term), `COUNT(*)`, `COUNT(expr)`, `SUM(expr)`, `MIN(column)` and `MAX(column)`, with or without aliases. `GROUP BY` terms are columns of the table (no expressions, no ordinals).
-- The table is an ordinary rowid table of the database (not a view, a virtual table or a `WITHOUT ROWID` table) with at least `--parallel-min-rows` rows. Counting them would mean reading them, so: when its rowids span fewer than that (the two ends of the rowid b-tree), it is small; otherwise its rows are estimated from the b-tree, at most once every 10 seconds per table. The span is cut into 16 parts, each looked at from both ends (its first and last rowid, and how far apart the 64 rows nearest each end are); a part with fewer than 64 rows is counted, a part whose ends show different densities is halved and looked at again (at most 256 parts, about 0.1–0.2 ms in all). Rowids that are timestamps or other sparse ids therefore do not make a small table look large; a small table with many separate clusters of rowids can still be overestimated and split (same result, more work).
-- Grouping columns and the columns of `MIN` / `MAX` use the BINARY collation and a declared type of INTEGER, TEXT, REAL or NUMERIC affinity (not a column without a type, nor `ANY` of a STRICT table): their equal values are then the same value, so which row of a group a value comes from does not matter.
-- SQLite's plan for the statement scans the whole table (`SCAN t`, perhaps with temporary b-trees for `GROUP BY` and `ORDER BY`), and the plan of each range is a search of the rowid range: splitting changes nothing about the work per row. A plan that uses an index is left alone, and so is a bare `SELECT COUNT(*) FROM t`, which SQLite answers by counting b-tree cells.
-- The compiled programs (`EXPLAIN`) of the range statement and of the combining statement read only that table (respectively the in-memory table), call only deterministic built-in functions (`abs`, `coalesce`, `length`, `like`, `lower`, `substr`, `round`, … the list is `shape::SCALAR_FUNCTIONS`) and the four aggregates. `LIMIT` and `OFFSET` are numbers and parameters. Names in `HAVING` and `ORDER BY`, outside the aggregates, are grouping columns, aliases or the table's name or alias in front of a grouping column: anything else (`rowid`, a column outside `GROUP BY`) would mean something else to the combining statement.
-
-**How**: the statement's connection takes a snapshot (`sqlite3_snapshot_get`) and the others open it (`sqlite3_snapshot_open`) while it still holds its read transaction, so no checkpoint can move past it; the bundled SQLite is built with `-DSQLITE_ENABLE_SNAPSHOT` for this. Right after a start on a checkpointed database, before the first write, there is no snapshot to take; the connections then all read the database file alone, and a write landing while they start is noticed (one connection then runs the statement). Ranges are cut where the rows are: 64 probes of the rowid b-tree find long stretches without rows, which are left out when cutting the rest evenly. Each range runs `SELECT <partial aggregates> … WHERE (<the WHERE>) AND rowid BETWEEN … GROUP BY …`; its rows go into an in-memory table of the same name with the grouping columns' declared types, where SQLite runs the original select list, `HAVING`, `ORDER BY` and `LIMIT` with each aggregate replaced by the aggregate of its partial values (`COUNT` and `SUM` by `SUM`, `MIN` by `MIN`, `MAX` by `MAX`). The in-memory database has the limits of the database's connections (a long `LIKE` pattern in `HAVING` is refused as on one connection) and reads double-quoted text as names only. The schema version the checks saw is read again on the snapshot; if the schema changed in between (a table rebuilt with another collation), the statement runs on one connection. A `SUM` is only taken from the split when every partial sum is an integer and the number of values times their largest magnitude stays within 64 bits, so that no order of additions overflows; otherwise the statement runs again on one connection, which gives its own result or error.
-
-**Resources**: the additional connections come from the read pool, only if they are free right now (never waited for), and all split statements of a database together hold at most `--parallel-pool-percent` of the pool; no statement uses more ranges than `--parallel-max-ranges` or the CPUs. The ranges run inside the read gate pass of their request (§3): a RESTART waiting for reads waits for a split statement exactly as for one read of the same length, and a closed gate never holds up a range. If one range fails, is interrupted at the deadline or collects more than `--parallel-max-partial-rows` partial rows, all ranges stop at once and the statement runs on one connection; a client never sees a partial result.
-
-**Runs on one connection instead** (`xsqld_parallel_fallback_total{reason}`): `small` (fewer rows than `--parallel-min-rows`, by the span of its rowids or the estimate), `table` (not an ordinary rowid table, or a grouping or MIN / MAX column whose collation or type does not allow an exact split, or an alias that is a column name), `plan` (the plan uses an index or the counting shortcut, an unlisted function, a column the combining statement does not have), `pool` (no additional connection free), `snapshot` (the connections could not be put on one snapshot). Run on one connection after splitting: `inexact` (a SUM that is not an integer sum or might overflow in some order), `rows` (more partial rows than allowed) and `error` (a range failed or hit the deadline). The same statement text is then not looked at again: after `inexact` and `rows` until the server restarts, after `table` and `plan` until the schema changes (`PRAGMA schema_version`), so that, for example, a `COUNT` on an indexed column costs only its parse; at most 1024 texts are remembered, then the list starts over. A plan that SQLite chooses by the bound values (with `sqlite_stat4`) is remembered by text all the same: such a statement may be left unsplit for values that would have allowed it. The other metrics: `xsqld_parallel_considered_total` (statements of the shape), `xsqld_parallel_runs_total`, `xsqld_parallel_ranges_total`, `xsqld_parallel_merge_*`.
-
-**Not split, on purpose**: `AVG`, `TOTAL` and sums of REAL values (the last digits of a floating-point sum depend on the order of additions); `COUNT(DISTINCT …)`, `GROUP_CONCAT` and other aggregates that cannot be combined from parts or depend on row order; window functions, CTEs, joins, subqueries, compound selects; views, virtual tables and `WITHOUT ROWID` tables (no rowid ranges); statements planned on an index, including a `GROUP BY` on an indexed column (ranges of the index key would split those, 4 times as fast in the measurements, but are not implemented); NOCASE / RTRIM collations and untyped columns as grouping columns or in `MIN` / `MAX`, and `MIN` / `MAX` of expressions (equal values that differ, such as `'a'` and `'A'`, would show whichever row came first); `CURRENT_TIMESTAMP`, `date('now')`, `random()` and the like (each range would see its own value).
-
-## 4. Known differences from sqld
-
-Places where results differ from sqld without affecting the runtime:
-
-| Item | sqld 0.24.32 | xsqld | Impact |
-|---|---|---|---|
-| Message of a syntax error | sqld's own parser: `SQL string could not be parsed: syntax error around L1:6: …` | SQLite's wording: `SQL string could not be parsed: near "x": syntax error` | Same error code `SQL_PARSE_ERROR`, and the batch likewise does not run at all. The runtime only matches the wording of constraint errors such as `UNIQUE constraint failed`, which is identical to sqld |
-| `last_insert_rowid` when no new row id was produced | One connection per stream, so it carries the value of the stream's earlier requests | Starts from 0 for every request, like a new sqld stream | Only visible when inserting into a table without rowid and running `SELECT last_insert_rowid()`; the runtime does not read it (only the adapter turns it into D1's `meta.last_row_id`), and which stream the pool hands out is not deterministic anyway |
-| `rows_read` / `rows_written` | libsql's own counters (rows scanned) | Rows returned / rows changed | The adapter only copies them into D1's `meta`; the runtime does not read them |
-| `replication_index` | WAL frame number | `null` | Only used for replication; the runtime does not read it |
-| `sqlite_schema.sql` after creating a database from a dump | Statements are parsed and reassembled: comments are lost and whitespace changes | Statements from the dump run as they are; table definitions keep the original text | Some migration guards look at the text of `sqlite_master.sql`; xsqld is the more predictable of the two |
-| Multi-line triggers in a dump | Creating the database fails (statements are split at a `;` at the end of a line: `incomplete input`) | Works (statements are split with `sqlite3_complete`) | — |
-| `PRAGMA foreign_keys = …` | Runs, affecting only that stream's connection | Refused, with the same error sqld gives for other PRAGMA assignments (§3: all streams share the write connection) | Unused by the runtime |
-| Requests with a `Host` that is not a local name, or with an `Origin` or `Sec-Fetch-Site` header | Accepted | 403 (§2) | The runtime uses `<name>.db` and `sqld-admin` and sends neither header |
-| LIKE and GLOB patterns longer than 1000 bytes | Run (up to 50000 bytes; a pattern of some 40 KB crashes the process) | `LIKE or GLOB pattern too complex` (§1.1) | The runtime's patterns are short search terms |
-| `CREATE VIEW temp.v …`, `CREATE TRIGGER temp.t …` | Run, on the stream's own connection | Refused like other temporary objects (§3) | Unused by the runtime |
-| A statement behind a byte order mark, a vertical tab or Unicode whitespace (U+00A0, U+3000, …) | `SQL_PARSE_ERROR` | Runs: SQLite skips them (Unicode whitespace only around the statement) | Clients do not send such text |
-| Exporting non-UTF-8 text values | The dump fails | Written as `CAST(X'…' AS TEXT)`; loading it back gives the same bytes | — |
-| Statements in a dump used to create a database | Anything runs | Only what dumps consist of: `PRAGMA foreign_keys=OFF`, `BEGIN` / `COMMIT`, `CREATE TABLE` / `INDEX` / `VIEW` / `TRIGGER`, `INSERT INTO`, `DELETE FROM sqlite_sequence`, `ANALYZE sqlite_schema`, one statement each; anything else gets 400 | Dumps of databases with virtual tables need `PRAGMA writable_schema`, which xsqld refuses; the runtime's databases have no virtual tables |
-| Dumps that do not load on sqld | Text containing NUL, and `sqlite_sequence` left over after its last AUTOINCREMENT table was dropped, make the dump fail to load | Text with NUL is written as `CAST(X'…' AS TEXT)`; `DELETE FROM sqlite_sequence` is skipped when the new database has no such table. Both load | — |
-| Deferred foreign keys (`DEFERRABLE`) and concurrency | Checked at the commit of each statement outside a transaction and at `COMMIT` | Checked at the same points (§3), but concurrent requests in one group may run in a different order | Concurrent requests have no defined order, so any order is valid; the runtime has no `DEFERRABLE` |
-| A write whose `RETURNING` rows exceed the response limit | `RESPONSE_TOO_LARGE`, and the write is kept | `RESPONSE_TOO_LARGE`, and the write is undone (§3) | The error now says what happened; the runtime's `RETURNING` results are small |
-| A protocol error late in a pipeline (an unknown `sql_id` after other requests) | 400, after running the requests before it | 400, nothing runs (every request is checked before the first runs) | Deliberate: a client that got 400 must be able to assume nothing was written |
-| Integral REAL values after a dump and reload (inherited from sqld's dump format) | `2.0` in a column without affinity, with BLOB affinity or STRICT `ANY` comes back as `2` | The same: the dump is byte-identical to sqld's | `x / 4` gives `0` instead of `0.5`; `-0.0` becomes `0`. Changing it would make dumps differ from sqld's |
-| Case of database names | Case sensitive | The same; on a case-insensitive file system (macOS by default) `TENANT` and `tenant` are one file opened as two databases, each with its own write thread | Inherited from the file layout; Linux is not affected |
-| Message of a malformed base64 blob | `invalid value: string "…", expected binary data encoded as base64` | `bad base64: …` (both 400 with `Cannot deserialize client message from JSON`; trailing `=` are accepted by both) | Clients send valid base64 |
-| `synchronous` and others | See §1.1 | See §1.1 | Intentional (§1.1) |
-
-### 4.1 Known issues
-
-The code review of 0.1.0 listed issues that 0.1.1 did not fix; 0.1.2 fixes them (CHANGELOG.md) except the ones below. The first row is a cost of split aggregates (0.1.3, §3.1). Differences from sqld that are deliberate or inherited from sqld's formats (a protocol error late in a pipeline, integral REAL values after a reload, case-sensitive database names, a few error texts) are listed in §4 instead. The runtime, as it uses xsqld today, runs into none of these.
-
-| Issue | When it happens | Effect | Why it stays |
-|---|---|---|---|
-| The WAL can still grow while reads longer than `--checkpoint-reader-wait-ms` overlap without a break | Read requests each running longer than the wait (200 ms by default), always at least one of them running, while writes go on | The RESTART with the read gate closed fails too, and is tried again only after four times the wait; the WAL grows at the rate of the writes as long as that lasts. Each read still ends at its deadline (`--request-timeout-ms`), so the pattern cannot last longer than the reads themselves | Only cutting reads off would restart the WAL sooner, which would turn checkpoint pressure into errors for clients; reads of 10–30 ms following each other closely, the case found in the review, no longer starve the checkpoint (§3) |
-| A split aggregate that must run again on one connection takes longer than running there at once | A statement of the §3.1 shape whose sums turn out not to be exact integer sums, that has more groups than `--parallel-max-partial-rows` allows, or whose range fails | The time of the split is spent first (about a third of the time on one connection, with 4 ranges); a statement that took nearly `--request-timeout-ms` on one connection can then reach the deadline. After `inexact` and `rows` the same statement is not split again | Knowing beforehand would need statistics xsqld does not keep (`ANALYZE` is refused, as on sqld); these cases are rare (sums near 2⁶³, REAL values in a SUM, millions of groups in a table without an index on them) |
-| An abandoned create does not interrupt a statement of the dump that is already running | The admin client gives up while a long statement of the dump (`INSERT … SELECT`) runs | That statement runs on until it ends or `--dump-load-timeout-ms` is reached, holding the database's lock; nothing is created either way | Bounded by the load time limit; the download itself stops at once |
-| The response write limit is on a stall, not on the whole response | A client that takes a few bytes just before every `--response-write-timeout-ms` | It keeps its connection slot for as long as it goes on | A slow reader that does read is served, as most HTTP servers do; with `--max-connections` 1024 and local clients only this is not a lockout |
-
-## 5. Tests (local macOS, Apple silicon)
-
-SQLite 3.54.1 (rusqlite 0.41 `bundled`). sqld is the official image `ghcr.io/tursodatabase/libsql-server:v0.24.32`, run in local Docker.
-
-### 5.1 Unit tests
-
-`cargo test`: 200, all passing (including HTAP synchronization, recovery, read-gate and metrics tests in this fork). Covered: protocol encoding and decoding, conditional steps, a failing transaction in a group commit rolling back only itself, redoing a group after SQLite rolled back the whole of it, rolling back a pinned transaction on timeout, 400 for expired or reused batons, queue timeouts, interrupting requests at their deadline, checkpoints and the TRUNCATE on shutdown, writes waiting for the checkpoint thread until its run ends, dumps byte-identical to sqld's, creating databases from dumps, the directory layout of created and deleted databases, and the version in `--version`, `/health` and `/metrics`.
-
-Every item raised in code review has a test: random SQL lexer input (with all its prefixes) stays in bounds; the request that made the write thread panic gets an error and writes continue afterwards; a panic ends the process with SIGABRT (tested in a child process); state-changing PRAGMAs, temporary tables and `load_extension()` are refused while reading PRAGMAs works; the live database completes a TRUNCATE checkpoint while a client is not reading `/dump`, and a stalled or overlong dump ends with an error and removes its copy; a full write queue answers 503 but lets the pinned stream in; header and body read timeouts, connection and concurrent request limits; quick reads do not queue while slow queries occupy the read pool; slow groups are committed early; `dump_url` masking, IPv6 `Host` headers, total download time; other databases do not wait while one is being created; non-UTF-8 text round-trips through a dump; database creation accepts only dump statements; a failed group transaction start is rolled back first; deferred foreign keys are checked per request; VACUUM is unavailable; `defer_foreign_keys` set outside a transaction does not reach the next stream; concurrent dumps are limited until their export ends; writes wait for the checkpoint thread exactly when it is `--checkpoint-pages` frames behind. From an external test of 0.1.0: queued requests run out on time while a transaction holds the write thread; database locks are forgotten once unused, also after deleting names that do not exist and after a waiter is cancelled; requests of web pages are refused and run nothing. From the review of 0.1.0: a `COMMIT` behind a byte order mark or other whitespace only SQLite skips stays inside its request and nothing is written twice, and a commit inside the group transaction rolls it back; objects cannot be created in the `temp` schema while ordinary schema changes work; long LIKE and GLOB patterns are refused and the longest allowed one runs on a 2 MB stack; counting statements reads the text once (4 MB of semicolons in a trigger body) and agrees with `sqlite3_complete` on random text; a create abandoned during the download leaves no database at whichever point the download stopped; requests under a rebound host name are refused while Node's `fetch` is served; long statements stay out of the statement cache. For 0.1.2 (the rest of that review): three clients reading back to back while two write no longer grow the WAL past the RESTART size (7.9 MB with the fix reverted, 0.4 MB with it, every read successful); a WAL that started over forgets a failed RESTART; an idle write thread wakes up at most once, also with `--checkpoint-idle-ms 0`; a client that never reads a 40 MB response loses its connection and the only connection slot is free again; every numeric flag is refused outside its range and accepts both ends; templates that mix up databases and the name `xsqld-tmp` under `{ns}/data` are refused; a new database does not take over a stale WAL; a cancelled first open followed by a DELETE does not bring the database back; leftovers of crashed builds and orphaned WAL files are removed at startup, files in use stay; a dump with a statement past the size limit, or one that runs past the time limit, fails and leaves nothing (and the long line is not read in whole); view and index definitions ending in a `--` comment, text with NUL and a leftover `sqlite_sequence` load back; the completeness check agrees with `sqlite3_complete` on random text given line by line and reads a trigger of 100,000 lines once; triggers behind Unicode whitespace or a byte order mark are one statement; `dump_url` takes `http://[::1]/x`, never logs user names, passwords or raw control characters, and is not fetched for a create that cannot succeed; deferred foreign keys fail where sqld fails them; `ROLLBACK TRANSACTION t TO s` rolls back to the savepoint; a write whose `RETURNING` rows are too large is undone, grouped, on its own and inside a transaction; the smaller differences listed in CHANGELOG.md behave as on sqld. Counting statements is checked by the bytes it reads, not by time. With each fix reverted, its test fails. Another test checks that SQLite's memory really comes from mimalloc (true in a child process that switched, false in a process that did not). For 0.1.3 (split aggregates, §3.1): the shape parser takes the statements it should and refuses some 50 others, and numbers parameters as SQLite does; split results equal one connection's for 19 statements over four random data sets, and 20 kinds of statements run on one connection for the expected reason with the same result; under writes that keep a count and a sum constant every split result shows them (139 of 150 do not when the connections start their read transactions apart); the untouched-WAL rule and a write landing in it; a failing range stops the others at once; the deadline; a busy pool; the read gate sees one read and never holds up the ranges; a remembered plan is forgotten when the schema changes; the row estimate is exact for dense rowids and close for sparse ones, and a small table with sparse rowids is not split. From the review of 0.1.3: `rowid` and double-quoted names outside `GROUP BY` in `HAVING` / `ORDER BY`, a 2000-byte `LIKE` pattern in `HAVING`, and a table rebuilt between the checks and the snapshot give one connection's result. Each of 28 protections was removed in turn and its test failed. For 0.1.4 (shared workers, idle close): a database without work holds no worker, neither after a request nor while a transaction is left open, and the timers still run the idle checkpoint and end the transaction; a request arriving at the moment the worker leaves an empty queue is run; a stop returns only once the connections are closed, also a second one, and a writer dropped without one shuts down; an idle database is closed and opens again with its data while one held by a request or with an open transaction stays open; 200 writes racing 300 idle closes all succeed and are all there; tasks behind 20 blocked ones start at once, 600 tasks at a limit of 300 workers all run with never more than 300, and timers fire in order. From the review of 0.1.4: a timer that fires while a worker is still leaving is not lost (the transaction left open is rolled back and the request behind it answered). A database that keeps being written to is run for its requests only: the idle checkpoint's timer sets itself again without a worker (21 runs for 20 requests; 28 with that removed). After 80 tasks at once, one task at a time leaves fewer than half of the workers the burst started (all of them stay when tasks are handed to waiting workers in turn). With each of these six protections removed its test fails.
-
-### 5.2 Differential tests
-
-`tests/compare.py`: sends the same requests to sqld and xsqld and compares the results field by field (except `query_duration_ms` and the text of batons).
-
+# xsqld (SeekDB / MySQL Backend Gateway)
+
+`xsqld` is a Rust gateway sidecar that exposes [`sqld`](https://github.com/tursodatabase/libsql)'s **Hrana-over-HTTP** (`POST /v2/pipeline`) and **Admin** (`/v1/namespaces/...`) APIs backed by **SeekDB / OceanBase CE / MySQL** over native MySQL protocol (`mysql_async`).
+
+Clients get simultaneous dual-protocol access to the exact same data:
+- **MySQL / SeekDB (`2881`)** for ORMs, BI tools, MySQL CLI, vectorized scans, and hybrid/columnar tables.
+- **Hrana HTTP (`8080`)** for lightweight HTTP/Edge clients (`@libsql/client`, curl, workers) speaking MySQL SQL dialect.
+
+## Endpoints
+
+### User port (`--http-listen-addr`, default `127.0.0.1:8080`)
+- `POST /v2/pipeline` — Hrana v2 JSON (`execute`, `batch` with `BatchCond`, `close`, stateful `baton` transactions). Namespace is selected from the first label of the `Host` header (`app1.db` -> `app1`).
+- `GET /health` — JSON version & commit info.
+- `GET /metrics` — Prometheus text metrics.
+
+### Admin port (`--admin-listen-addr`, default `127.0.0.1:8081`)
+- `POST /v1/namespaces/{ns}/create` — Creates MySQL database `{ns}` (body: `{}` JSON). System databases (`oceanbase`, `mysql`, `information_schema`, `performance_schema`, `sys`) are rejected.
+- `DELETE /v1/namespaces/{ns}` — Closes pools/transactions for `{ns}` and drops database `{ns}`.
+- `GET /health`, `GET /metrics`
+
+Databases created directly via the MySQL port (`2881`) are discovered lazily via `information_schema.SCHEMATA`.
+
+## Authentication & Security
+- **Without `--auth-token`**: Protected by Host allowlist (`--allowed-host-suffixes`, default `db,local,localhost`) and browser CSRF rejection (`Origin` / `Sec-Fetch-Site` -> `403`).
+- **With `--auth-token` / `XSQLD_AUTH_TOKEN`**: Requires `Authorization: Bearer <token>` on all non-`/health` endpoints (`401` on missing/invalid token) in addition to Host checking.
+
+## Key Flags
+| Flag | Env | Default | Description |
+| --- | --- | --- | --- |
+| `--mysql-host` | `XSQLD_MYSQL_HOST` | `127.0.0.1` | SeekDB / MySQL host |
+| `--mysql-port` | `XSQLD_MYSQL_PORT` | `2881` | SeekDB / MySQL port |
+| `--mysql-user` | `XSQLD_MYSQL_USER` | `root` | Database user |
+| `--mysql-password` | `XSQLD_MYSQL_PASSWORD` | `""` | Database password |
+| `--mysql-url` | `XSQLD_MYSQL_URL` | — | Optional full `mysql://...` URL |
+| `--auth-token` | `XSQLD_AUTH_TOKEN` | — | Optional Bearer token |
+| `--pool-min` / `--pool-max` | — | `2` / `64` | Per-namespace pool bounds |
+| `--pinned-tx-timeout-ms` | — | `5000` | Auto-rollback idle baton transaction |
+| `--request-timeout-ms` | — | `40000` | Pipeline deadline (+ `KILL QUERY` on backend) |
+
+## Build & Run (Docker)
 ```bash
-docker run -d --name sqld-ref -p 127.0.0.1:18080:8080 -p 127.0.0.1:18081:8081 --entrypoint /bin/sqld \
-  ghcr.io/tursodatabase/libsql-server:v0.24.32 --enable-namespaces --http-listen-addr 0.0.0.0:8080 --admin-listen-addr 0.0.0.0:8081
-xsqld --db-path /tmp/x --http-listen-addr 127.0.0.1:28080 --admin-listen-addr 127.0.0.1:28081 --parallel-min-rows 1000
-python3 tests/compare.py
+docker run --rm \
+  -v "$PWD":/work -w /work \
+  -e CARGO_TARGET_DIR=/tmp/cargo-target \
+  rust:latest sh -c 'cargo test && cargo clippy --all-targets -- -D warnings && cargo build --release'
 ```
-
-Result (0.1.3, xsqld started with `--parallel-min-rows 1000`): all 86 pipeline requests identical, and 14 aggregates, 10 of them split on xsqld. Result (0.1.2): all 86 pipeline requests identical, and so are 48 requests sent at the same time (run in groups on xsqld; the rows they left as well); with 0.1.1 the cases added for 0.1.2 show 13 differences. Earlier result (0.1.1): all 48 pipeline requests identical; protocol behaviour (continuing, expired and reused batons, `close`, malformed requests, missing databases, the admin API's errors) identical; `GET /dump` of the same data byte-identical; databases created from the dump on both sides export identically again. Covered: round trips of every kind of value (integers as strings, 64-bit limits and 2^53+1, floats such as `1e300` / `-0.0`, Unicode text, empty and non-empty blobs, a 1 MB blob); foreign keys, UNIQUE, CHECK, trigger `RAISE`, views, tables without rowid, UPSERT, `RETURNING`, `unhex()` and JSON functions, `ALTER TABLE`; the wording of UNIQUE / NOT NULL / FOREIGN KEY / CHECK errors; wrong parameter counts, named and numbered parameters; empty results; rollback when a batch fails halfway, all kinds of conditional steps; transactions across requests; the batches the runtime actually sends and its merged session requests; Hrana request types that are not supported.
-
-xsqld defects found and fixed through these comparisons: `SELECT *` missing columns after another connection altered the table (column information must be read after the first step), an empty batch treated as `close`, positional errors such as `no such column` that must be reported as `SQL_INPUT_ERROR`, and a batch with a syntax error that must not run at all.
-
-### 5.3 Replaying the runtime's database migrations
-
-This test lives in the downstream project, not in this repository, because it needs the runtime's source tree. With the runtime's own database client and migration runner, it runs every migration of its tenant database on an empty database, exports it, creates a new database from the dump, and compares row counts per table and the bytes of the dumps.
-
-| | xsqld | sqld 0.24.32 |
-|---|---|---|
-| Migrations | 85/85, 422 ms; a second run executes nothing again | 85/85, 924 ms |
-| Row counts per table after creating from the dump (169 tables) | Same | Same |
-| Dump of the recreated database vs. the original dump | Byte-identical | Different (§4: table definitions are rewritten) |
-
-### 5.4 Load tests (short local runs, orders of magnitude only)
-
-The load test scripts live in the downstream project, not in this repository. A fresh data directory for each item. These are short runs on a laptop SSD; the numbers on a Linux server with a cloud volume are in §6. sqld runs in Docker's virtual machine, so its numbers are low and only for reference.
-
-| Item | xsqld | sqld (Docker) |
-|---|---|---|
-| Single-row writes, 1 / 4 / 16 writers, transactions per second | 5030 / 11142 / 15505 | 803 / 525 / 477 |
-| Batches of 100 rows, 1 / 4 / 16 writers, rows per second | 17586 / 22989 / 29488 | — |
-| Concurrent writers: p99 with 16 writers; p99 with 64 writers; "busy" errors | 16.5 ms; 23.3 ms; 0 | 125 ms; —; one 5 s timeout |
-| Checkpoints under load, 60 s: longest probe read / longest probe write / largest WAL / writes | 18–22 ms / 106–108 ms / 52–55 MB / about 19,000 rows per second (two runs) | — |
-
-The probe write time of the checkpoint test includes waiting behind the writers (p50 14 ms); once or twice every 60 s it just exceeds 100 ms, caused by the TRUNCATE on the write thread. Before the checkpoint thread (with the write thread running PASSIVE itself) the same test gave: longest probe read 95 ms, longest write 132 ms, 12,197 rows per second.
-
-On a cloud block storage volume (about 3800 rows per second, 30 minutes) the checkpoint thread used to fall behind: its runs took about 200 ms, and the RESTART at 32 MB, run about once a second, had to copy everything written meanwhile and stopped writes for 400–900 ms each time (probe write p99 746 ms). Since then writes wait for a checkpoint run once `--checkpoint-pages` frames have been written after it began, which keeps every run and every RESTART to about that many frames. In a local Docker VM limited to 10,000 write IOPS this costs no throughput (4184 against 4225 rows per second, 300 s); the waits added up to 3.9 s. On the cloud volume: §6.
-
-### 5.5 Rollback drill
-
-Same data directory: sqld 0.24.32 creates the `tenant` database, writes 1000 rows and stops cleanly → xsqld opens it, reads those 1000 rows, writes another 1000, exits on SIGTERM (only `data` and `.sentinel` are left in the database directory) → sqld starts again, logs `Replication log is dirty, recovering from database file`, both sets of 1000 rows are there, `PRAGMA integrity_check` is ok, and writing continues normally.
-
-### 5.6 Flushing on Linux (Linux VM of local Docker, ext4)
-
-Single-row writes, 16 writers: about 3800 transactions per second without `-DHAVE_FDATASYNC=1` (SQLite uses `fsync`), about 9000 with it. The idle checkpoint used to be TRUNCATE, which made the first write after idleness wait for a file system journal commit (about 5.5 ms); with PASSIVE and a WAL file that is not truncated while running, that spike is gone. The numbers that count are those on a Linux server (§6).
-
-## 6. Performance
-
-Acceptance runs of the load tests, on a cloud server: 8 dedicated vCPUs, 16 GB of memory, Debian 13, the data on a 100 GB network block storage volume (ext4, fsync p50 0.56 ms, p99 2.7 ms). Static musl build, default settings (`synchronous=FULL`), load generators on the same machine.
-
-| Test | Result |
-|---|---|
-| Single-row write transactions, 1 / 4 / 16 concurrent writers (30 s each) | 824 / 1654 / 3487 per second; p99 2.6 / 42 / 40 ms; 0 errors |
-| Batches of 100 rows, 1 / 4 / 16 writers (30 s each) | 4960 / 7684 / 9561 rows per second |
-| Concurrent single-row writers (10 min each) | 16 writers: p99 39 ms; 64 writers: p99 75 ms; 0 "busy" errors |
-| 32 writers for 1 hour, a probe writing and reading every 2 s | 0 failed probes; longest probe write 23 ms |
-| Checkpoints under continuous load (4 writers of 100-row batches, 30 min) | 3678 rows/s; probe write p99 202 ms, longest 375 ms; longest probe read 7.6 ms; WAL at most 39.5 MB; 0 errors |
-| Mixed reads and writes for 3 hours | 811,089 writes and 3,544,246 reads, 0 errors; memory 56 MB on average in the first quarter, 58 MB in the last (at most 61 MB) |
-| `kill -9` while writing, 100 rounds | 2,759,776 acknowledged rows, none lost; `integrity_check` ok; restart within 0.21 s |
-| Simulated power cut (SysRq `b`: immediate reboot without syncing) while writing, 10 rounds | No acknowledged row lost; `integrity_check` ok |
-| Indexed queries on a 10-million-row table, server-side execution time against the same query run directly in SQLite (p50) | 0.88–1.04 times; HTTP round trip p50 0.27 ms (primary key) to 1.6 ms (a 50-row page) |
-
-Probe writes queue behind the writers, so their latency includes waiting for the group in front of them; the probe write p99 of the checkpoint test is mostly that queue, not checkpoint pauses.
