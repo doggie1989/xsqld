@@ -95,6 +95,7 @@ pub async fn run(
     mut budget: u64,
     deadline: Instant,
     metrics: &NsMetrics,
+    route: &crate::route::RouteCtx,
 ) -> Result<ExecResult, ExecAbort> {
     let mut results = Vec::with_capacity(requests.len());
     let mut closed = false;
@@ -142,6 +143,7 @@ pub async fn run(
                     metrics,
                     &mut in_trans,
                     &mut transport_dirty,
+                    route,
                 )
                 .await?
                 {
@@ -278,6 +280,10 @@ async fn run_batch(
     Ok(Ok(res))
 }
 
+// Private execution plumbing: the argument list mirrors the request lifecycle (connection, statement,
+// budget, deadline, metrics, transaction state, routing context). Bundling the mutable flags would spread
+// a state struct across four functions for no behavioural gain.
+#[allow(clippy::too_many_arguments)]
 async fn run_stmt(
     conn: &mut Conn,
     stmt: &proto::Stmt,
@@ -286,11 +292,68 @@ async fn run_stmt(
     metrics: &NsMetrics,
     in_trans: &mut bool,
     transport_dirty: &mut bool,
+    route: &crate::route::RouteCtx,
 ) -> Result<Result<StmtResult, proto::Error>, ExecAbort> {
     let input = match prepare_input(stmt) {
         Ok(i) => i,
         Err(e) => return Ok(Err(e)),
     };
+    // Routing is limited to a single autocommit SELECT with no bound parameters. Transactions stay pinned
+    // to SeekDB, and batches are never routed.
+    if let Some(view) = route.view.as_ref()
+        && !*in_trans
+        && input.params.is_empty()
+        && input.kind == Kind::Select
+    {
+        // Gate order is cheapest-first: the structural gate is cached and does no I/O, so a query it
+        // refuses must not cost either the freshness probe or the EXPLAIN round-trip.
+        // Started before the gates so a routed query's reported duration includes the routing decision.
+        // Counters are recorded only on the routed success path: a refused query falls through to
+        // execute_prepared, which does its own counting, and must not be counted twice.
+        let started = Instant::now();
+        metrics
+            .route_considered
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let admitted = tokio::task::block_in_place(|| crate::route::admit(view, &input.rewritten_sql, route.min_rows));
+        if let Err(reason) = admitted {
+            *metrics.route_refused.lock().entry(reason.as_str()).or_insert(0) += 1;
+        } else if let Ok(routed) = admitted {
+            // Freshness gate: the outbox is pruned only after the mirror commits, so an empty outbox means
+            // every committed change is already in the mirror. Anything pending means a stale read.
+            let pending: Option<i64> = conn
+                .query_first(format!("SELECT COUNT(*) FROM {}", crate::capture::OUTBOX_TABLE))
+                .await
+                .unwrap_or(None);
+            if pending == Some(0) {
+                // Benefit gate on the real access path: a selective index lookup is far faster on SeekDB
+                // than a DuckDB scan, so routing it would be a net loss even though provably equivalent.
+                let explain: Vec<String> = conn
+                    .query(format!("EXPLAIN {}", input.rewritten_sql))
+                    .await
+                    .unwrap_or_default();
+                if crate::route::plan_profitable(&explain, route.min_rows) {
+                    let executed = tokio::task::block_in_place(|| crate::route::execute_routed(view, &routed, started));
+                    match executed {
+                        Ok(r) => {
+                            metrics.queries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            metrics.query.record(started.elapsed());
+                            metrics.routed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return Ok(Ok(r));
+                        }
+                        Err(reason) => {
+                            *metrics.route_refused.lock().entry(reason.as_str()).or_insert(0) += 1;
+                        }
+                    }
+                } else {
+                    *metrics
+                        .route_refused
+                        .lock()
+                        .entry(crate::route::Refused::NotProfitable.as_str())
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+    }
     execute_prepared(conn, input, budget, deadline, metrics, in_trans, transport_dirty).await
 }
 
@@ -532,7 +595,11 @@ pub fn mysql_val_to_hrana(val: MyVal, col: &Column) -> Value {
             if d.is_finite() { Value::Float(d) } else { Value::Null }
         }
         MyVal::Double(d) => {
-            if d.is_finite() { Value::Float(d) } else { Value::Null }
+            if d.is_finite() {
+                Value::Float(d)
+            } else {
+                Value::Null
+            }
         }
         MyVal::Date(y, m, d, hh, mm, ss, us) => {
             if matches!(ty, ColumnType::MYSQL_TYPE_DATE | ColumnType::MYSQL_TYPE_NEWDATE) {

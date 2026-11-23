@@ -119,6 +119,47 @@ pub struct Config {
     /// Largest result of one HTTP request (estimated JSON size of all rows)
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
     pub max_response_bytes: u64,
+
+    /// Mirror SeekDB tables into an in-process DuckDB columnar store and keep them synced
+    #[arg(long, env = "XSQLD_MIRROR_ENABLED")]
+    pub mirror_enabled: bool,
+    /// Directory holding one DuckDB file per namespace
+    #[arg(long, env = "XSQLD_MIRROR_DIR", default_value = "xsqld-mirrors")]
+    pub mirror_dir: String,
+    /// How often the sync worker reconciles and applies changes
+    #[arg(long, default_value_t = 1_000)]
+    pub mirror_interval_ms: u64,
+    /// Most outbox rows applied in one cycle
+    #[arg(long, default_value_t = 10_000)]
+    pub mirror_batch: u64,
+    /// DuckDB memory_limit for the mirror
+    #[arg(long, default_value_t = 512)]
+    pub mirror_memory_limit_mb: usize,
+    /// Route a SELECT to the mirror only when its tables hold at least this many rows in total
+    #[arg(long, default_value_t = 200_000)]
+    pub route_min_rows: u64,
+    /// Per-query timeout hint sent to SeekDB for mirror snapshots; its own default ob_query_timeout is 10s
+    #[arg(long, default_value_t = 600_000)]
+    pub mirror_query_timeout_ms: u64,
+    /// Checkpoint the mirror every this many sync cycles; DuckDB otherwise grows the WAL without bound
+    #[arg(long, default_value_t = 150)]
+    pub mirror_checkpoint_cycles: u64,
+    /// Base period for dropping and reopening the mirror's DuckDB instance. Sustained apply grows
+    /// untagged native memory linearly (~2.7 MB/min measured) while Rust live bytes and DuckDB's tagged
+    /// memory stay flat; reopening releases it. The mirror is a derived cache, so this is safe.
+    /// The effective period is raised for large mirrors by --mirror-reopen-duty-pct.
+    #[arg(long, default_value_t = 120)]
+    pub mirror_reopen_cycles: u64,
+    /// Cap on the fraction of time spent re-snapshotting during reopens. The effective reopen period is
+    /// at least last_snapshot_time / (duty * cycle_interval), so a 10M-row table (~19s snapshot) is not
+    /// re-snapshotted every 48s. Small mirrors keep the short base period and stay tightly bounded.
+    #[arg(long, default_value_t = 5)]
+    pub mirror_reopen_duty_pct: u64,
+    /// Re-snapshot a table after this many applied changes. DuckDB keeps old row versions after MERGE and
+    /// does not reclaim them, so sustained churn grows RSS even with a constant row count (measured
+    /// ~0.44 MB/15s under continuous UPDATE versus ~0.05 MB/15s idle). A rebuild reclaims them.
+    #[arg(long, default_value_t = 50_000)]
+    pub mirror_rebuild_churn: u64,
 }
 
 impl Config {
@@ -201,7 +242,7 @@ impl Config {
         Ok(())
     }
 
-    fn numeric_bounds(&self) -> [(&'static str, i128, i128, i128); 17] {
+    fn numeric_bounds(&self) -> [(&'static str, i128, i128, i128); 26] {
         const HOUR_MS: i128 = 3_600_000;
         const GIB: i128 = 1 << 30;
         let n = |v: usize| v as i128;
@@ -229,6 +270,25 @@ impl Config {
             ),
             ("max-statements", n(self.max_statements), 1, 1_000_000),
             ("max-response-bytes", u(self.max_response_bytes), 1024, 16 * GIB),
+            ("mirror-interval-ms", u(self.mirror_interval_ms), 50, HOUR_MS),
+            ("mirror-batch", u(self.mirror_batch), 1, 10_000_000),
+            ("mirror-memory-limit-mb", n(self.mirror_memory_limit_mb), 64, 1 << 20),
+            ("route-min-rows", u(self.route_min_rows), 0, 1_000_000_000),
+            (
+                "mirror-query-timeout-ms",
+                u(self.mirror_query_timeout_ms),
+                1_000,
+                24 * HOUR_MS,
+            ),
+            (
+                "mirror-checkpoint-cycles",
+                u(self.mirror_checkpoint_cycles),
+                1,
+                1_000_000,
+            ),
+            ("mirror-rebuild-churn", u(self.mirror_rebuild_churn), 100, 1_000_000_000),
+            ("mirror-reopen-cycles", u(self.mirror_reopen_cycles), 10, 10_000_000),
+            ("mirror-reopen-duty-pct", u(self.mirror_reopen_duty_pct), 1, 50),
         ]
     }
 
@@ -265,7 +325,15 @@ mod tests {
         assert!(!valid_namespace(&"a".repeat(65)));
 
         assert!(c.usable_namespace("tenant"));
-        for sys in ["oceanbase", "OceanBase", "mysql", "MySQL", "information_schema", "performance_schema", "sys"] {
+        for sys in [
+            "oceanbase",
+            "OceanBase",
+            "mysql",
+            "MySQL",
+            "information_schema",
+            "performance_schema",
+            "sys",
+        ] {
             assert!(!c.usable_namespace(sys), "{sys} must be rejected");
         }
     }
@@ -383,6 +451,7 @@ mod tests {
                     "http_listen_addr",
                     "admin_listen_addr",
                     "allowed_host_suffixes",
+                    "mirror_dir",
                 ]
                 .contains(&id)
             })

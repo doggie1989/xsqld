@@ -37,6 +37,8 @@ pub fn admin_router(app: App) -> Router {
     Router::new()
         .route("/v1/namespaces/{ns}/create", post(create))
         .route("/v1/namespaces/{ns}", delete(remove))
+        .route("/v1/namespaces/{ns}/maintenance/{table}/begin", post(maintenance_begin))
+        .route("/v1/namespaces/{ns}/maintenance/{table}/end", post(maintenance_end))
         .route("/health", get(health))
         .route("/metrics", get(metrics_handler))
         .layer(DefaultBodyLimit::max(limits.max_body))
@@ -302,6 +304,13 @@ async fn metrics_handler(State(app): State<App>) -> Response {
 pub fn metrics_text(app: &App) -> String {
     let mut out = String::new();
     metrics::build_info(&mut out);
+    #[cfg(feature = "alloc-stats")]
+    metrics::put(
+        &mut out,
+        "rust_live_bytes",
+        "",
+        crate::alloc_stats::LIVE.load(std::sync::atomic::Ordering::Relaxed).max(0) as u64,
+    );
     let (streams, pinned) = app.streams.counts();
     metrics::put(&mut out, "streams", "", streams);
     metrics::put(&mut out, "streams_pinned", "", pinned);
@@ -375,16 +384,20 @@ async fn pipeline(
     };
 
     let head = slow_log_head(&req.requests);
+    let routed_before = ns_pool.metrics.routed.load(std::sync::atomic::Ordering::Relaxed);
     let deadline = started + app.cfg.request_timeout();
     let outcome = app
         .run_pipeline(&ns_pool, lease.id, lease.pinned, req.requests, deadline)
         .await;
     let elapsed = started.elapsed();
     if elapsed.as_millis() >= 1000 {
+        let routed = ns_pool.metrics.routed.load(std::sync::atomic::Ordering::Relaxed) - routed_before;
         tracing::warn!(
             ns = &*ns_pool.name,
             ms = elapsed.as_millis() as u64,
             sql = head,
+            engine = if routed > 0 { "duckdb" } else { "seekdb" },
+            routed_statements = routed,
             "slow request"
         );
     }
@@ -461,6 +474,20 @@ async fn create(State(app): State<App>, Path(ns): Path<String>, headers: HeaderM
 
 async fn remove(State(app): State<App>, Path(ns): Path<String>) -> Response {
     match app.delete(&ns).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => admin_error(e),
+    }
+}
+
+async fn maintenance_begin(State(app): State<App>, Path((ns, table)): Path<(String, String)>) -> Response {
+    match app.maintenance_begin(&ns, &table).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => admin_error(e),
+    }
+}
+
+async fn maintenance_end(State(app): State<App>, Path((ns, table)): Path<(String, String)>) -> Response {
+    match app.maintenance_end(&ns, &table).await {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => admin_error(e),
     }

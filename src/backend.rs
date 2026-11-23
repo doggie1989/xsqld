@@ -52,6 +52,11 @@ pub struct NsPool {
     pub name: Arc<str>,
     pub pool: Pool,
     pub metrics: Arc<NsMetrics>,
+    /// Published by the sync worker after each committed cycle; read by the routing path.
+    pub mirror: RwLock<Option<Arc<crate::route::MirrorView>>>,
+    /// Tables inside a maintenance window: capture is dropped and reconciliation is suppressed.
+    pub maintenance: Arc<RwLock<std::collections::BTreeSet<String>>>,
+    origin: Instant,
     last_used_epoch_ms: AtomicU64,
 }
 
@@ -59,6 +64,13 @@ impl NsPool {
     fn touch(&self, origin: Instant) {
         self.last_used_epoch_ms
             .store(origin.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// The mirror worker is an active user of this pool even when no HTTP request arrives. Without this,
+    /// a namespace written only by direct MySQL clients would be closed as idle and the mirror would
+    /// silently stop syncing — exactly the deployment this gateway is built for.
+    pub fn note_mirror_activity(&self) {
+        self.touch(self.origin);
     }
 
     fn idle_ms(&self, origin: Instant) -> u64 {
@@ -170,10 +182,7 @@ impl Backend {
         // Drain any pinned transactions belonging to this namespace before dropping the DB
         let victims = {
             let mut g = self.pinned.lock().await;
-            let ids: Vec<u64> = g
-                .iter()
-                .filter_map(|(&id, p)| (&*p.ns == ns).then_some(id))
-                .collect();
+            let ids: Vec<u64> = g.iter().filter_map(|(&id, p)| (&*p.ns == ns).then_some(id)).collect();
             ids.into_iter().filter_map(|id| g.remove(&id)).collect::<Vec<_>>()
         };
         for p in victims {
@@ -243,6 +252,9 @@ impl Backend {
             name: key.clone(),
             pool: Pool::new(opts),
             metrics: Arc::new(NsMetrics::default()),
+            mirror: RwLock::new(None),
+            maintenance: Arc::new(RwLock::new(std::collections::BTreeSet::new())),
+            origin: self.origin,
             last_used_epoch_ms: AtomicU64::new(self.origin.elapsed().as_millis() as u64),
         });
         g.insert(key, np.clone());
@@ -314,6 +326,9 @@ impl Backend {
         };
 
         let conn_id = conn.id();
+        // Bind before the match: a guard created inline would live to the end of the whole `match ... await`
+        // statement and hold a non-Send lock across the await point.
+        let mirror = ns_pool.mirror.read().clone();
         match exec::run(
             &mut conn,
             &requests,
@@ -321,6 +336,10 @@ impl Backend {
             self.cfg.max_response_bytes,
             deadline,
             &ns_pool.metrics,
+            &crate::route::RouteCtx {
+                view: mirror,
+                min_rows: self.cfg.route_min_rows,
+            },
         )
         .await
         {
@@ -400,6 +419,68 @@ impl Backend {
     }
 
     /// Expires pinned transactions that stayed open across HTTP requests past `--pinned-tx-timeout-ms`
+    /// Open a maintenance window: drop capture triggers and suppress reconciliation for one table so a
+    /// bulk load does not pay the per-row trigger tax. The caller must close the window afterwards.
+    pub async fn maintenance_begin(&self, ns: &str, table: &str) -> Result<(), AdminError> {
+        let np = self
+            .get_namespace(ns)
+            .await
+            .map_err(AdminError::Internal)?
+            .ok_or_else(|| AdminError::Missing(ns.to_owned()))?;
+        let mut c = np.pool.get_conn().await.map_err(|e| AdminError::Internal(e.into()))?;
+        let t = self
+            .find_table(&mut c, ns, table)
+            .await
+            .map_err(AdminError::Internal)?
+            .ok_or_else(|| AdminError::BadName(table.to_owned()))?;
+        // Suppress reconciliation first, otherwise the worker could re-snapshot mid-window.
+        np.maintenance.write().insert(table.to_ascii_lowercase());
+        for sql in crate::capture::drop_triggers(&t) {
+            c.query_drop(sql).await.map_err(|e| AdminError::Internal(e.into()))?;
+        }
+        Ok(())
+    }
+
+    /// Close a maintenance window: reinstall capture and re-snapshot the table, which recovers every row
+    /// written while capture was dropped.
+    pub async fn maintenance_end(&self, ns: &str, table: &str) -> Result<(), AdminError> {
+        let np = self
+            .get_namespace(ns)
+            .await
+            .map_err(AdminError::Internal)?
+            .ok_or_else(|| AdminError::Missing(ns.to_owned()))?;
+        let mut c = np.pool.get_conn().await.map_err(|e| AdminError::Internal(e.into()))?;
+        let t = self
+            .find_table(&mut c, ns, table)
+            .await
+            .map_err(AdminError::Internal)?
+            .ok_or_else(|| AdminError::BadName(table.to_owned()))?;
+        for sql in crate::capture::capture_triggers(&t) {
+            c.query_drop(sql).await.map_err(|e| AdminError::Internal(e.into()))?;
+        }
+        let view = np.mirror.read().clone();
+        if let Some(v) = view {
+            let cols = crate::sync::discover_columns(&mut c, ns, &t.name)
+                .await
+                .map_err(AdminError::Internal)?;
+            let duck = v.duck.lock();
+            crate::sync::snapshot_table(&duck, "src", &t, &cols, self.cfg.mirror_query_timeout_ms * 1000)
+                .map_err(AdminError::Internal)?;
+        }
+        np.maintenance.write().remove(&table.to_ascii_lowercase());
+        Ok(())
+    }
+
+    async fn find_table(
+        &self,
+        c: &mut Conn,
+        ns: &str,
+        table: &str,
+    ) -> anyhow::Result<Option<crate::capture::TableSchema>> {
+        let tables = crate::sync::discover_tables(c, ns).await?;
+        Ok(tables.into_iter().find(|t| t.name.eq_ignore_ascii_case(table)))
+    }
+
     pub async fn sweep_pinned(&self) {
         let limit = self.cfg.pinned_tx_timeout();
         let now = Instant::now();
@@ -439,8 +520,7 @@ impl Backend {
             let keys: Vec<Arc<str>> = g
                 .iter()
                 .filter_map(|(k, v)| {
-                    (!pinned_ns.contains(k) && v.idle_ms(self.origin) >= self.cfg.idle_close_ms)
-                        .then_some(k.clone())
+                    (!pinned_ns.contains(k) && v.idle_ms(self.origin) >= self.cfg.idle_close_ms).then_some(k.clone())
                 })
                 .collect();
             keys.into_iter().filter_map(|k| g.remove(&k)).collect()

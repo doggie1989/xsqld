@@ -18,21 +18,30 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 base64 = "0.22"
 bytes = "1"
 clap = { version = "4.5", features = ["derive", "env"] }
+duckdb = { version = "=1.20000.2", default-features = false, features = ["bundled"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 getrandom = "0.4"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["http1", "server", "server-graceful", "service", "tokio"] }
+# The system allocator kept growing under sustained sync load (varying-size SQL text and JSON
+# allocations each cycle); the SQLite-era code hit the same thing and switched to mimalloc.
+mimalloc = { version = "0.1.52", default-features = false }
 mysql_async = { version = "0.36", default-features = false, features = ["minimal"] }
 parking_lot = "0.12"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sqlparser = { version = "0.59", default-features = false, features = ["std", "visitor"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "io-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+
+[features]
+# 计数全局分配器：把 Rust 侧存活字节与进程 RSS 分开，用于定位 native(C++) 侧增长。
+alloc-stats = []
 
 [profile.release]
 lto = true

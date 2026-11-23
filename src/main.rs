@@ -1,18 +1,62 @@
 //! xsqld: Hrana-over-HTTP gateway backed by SeekDB / OceanBase / MySQL.
 
 mod backend;
+mod capture;
 mod config;
 mod exec;
 mod http;
 mod metrics;
+mod mirror;
 mod proto;
+mod route;
 mod sql;
 mod stream;
+mod sync;
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
+
+#[cfg(not(feature = "alloc-stats"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// Counting wrapper used only under `--features alloc-stats`. Live Rust bytes growing in step with RSS
+/// means a Rust-side leak; RSS growing while live bytes stay flat means native (C++) allocations, which
+/// neither the Rust allocator nor DuckDB's tagged `duckdb_memory()` accounting can see.
+#[cfg(feature = "alloc-stats")]
+pub mod alloc_stats {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicI64, Ordering::Relaxed};
+
+    pub static LIVE: AtomicI64 = AtomicI64::new(0);
+    pub struct Counting;
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            let p = unsafe { System.alloc(l) };
+            if !p.is_null() {
+                LIVE.fetch_add(l.size() as i64, Relaxed);
+            }
+            p
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            LIVE.fetch_sub(l.size() as i64, Relaxed);
+            unsafe { System.dealloc(p, l) }
+        }
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+            let np = unsafe { System.realloc(p, l, new) };
+            if !np.is_null() {
+                LIVE.fetch_add(new as i64 - l.size() as i64, Relaxed);
+            }
+            np
+        }
+    }
+}
+
+#[cfg(feature = "alloc-stats")]
+#[global_allocator]
+static GLOBAL: alloc_stats::Counting = alloc_stats::Counting;
 
 /// A panic anywhere ends the process so a service supervisor can restart cleanly.
 fn abort_on_panic() {
@@ -77,6 +121,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let mirror_worker = if cfg.mirror_enabled {
+        Some(sync::spawn_worker(backend.clone(), cfg.clone(), stop_rx.clone()))
+    } else {
+        None
+    };
     let user_srv = http::serve(user, http::user_router(backend.clone()), cfg.clone(), stop_rx.clone());
     let admin_srv = http::serve(admin, http::admin_router(backend.clone()), cfg.clone(), stop_rx);
     let servers = tokio::spawn(async move {
@@ -93,6 +142,9 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("requests still running at shutdown");
     }
     backend.shutdown().await;
+    if let Some(w) = mirror_worker {
+        let _ = w.join();
+    }
     tracing::info!("stopped");
     Ok(())
 }
