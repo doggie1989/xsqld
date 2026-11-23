@@ -89,6 +89,9 @@ pub struct Backend {
     pub cfg: Arc<Config>,
     pub streams: Arc<Streams>,
     pub idle_closed: AtomicU64,
+    /// `SELECT VERSION()` of the backend, reported verbatim by the MySQL listener so that a client
+    /// gating features on the server version sees the server it is actually querying.
+    pub backend_version: Option<String>,
     origin: Instant,
     base_opts: Opts,
     admin_pool: Pool,
@@ -137,6 +140,7 @@ impl Backend {
         Ok(Arc::new(Self {
             streams: Streams::new(cfg.stream_idle()),
             idle_closed: AtomicU64::new(0),
+            backend_version: ver,
             origin: Instant::now(),
             base_opts,
             admin_pool,

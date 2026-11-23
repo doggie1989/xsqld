@@ -453,6 +453,7 @@ mod tests {
                     "auth_token",
                     "http_listen_addr",
                     "admin_listen_addr",
+                    "mysql_listen_addr",
                     "allowed_host_suffixes",
                     "mirror_dir",
                 ]

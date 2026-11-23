@@ -20,6 +20,11 @@ Clients get simultaneous dual-protocol access to the exact same data:
 
 Databases created directly via the MySQL port (`2881`) are discovered lazily via `information_schema.SCHEMATA`.
 
+### MySQL protocol port (`--mysql-listen-addr`, default `127.0.0.1:3306`)
+- MySQL wire protocol (HandshakeV10, text result sets) for `mysql` CLI, ORMs, BI tools and any client that speaks the protocol. Statements go through the same pipeline as `POST /v2/pipeline`, so HTAP routing, budgets, transactions and metrics apply identically.
+- The schema *is* the namespace: `-D myns` (or the username when no database is given) selects it, and an unknown name is refused during the handshake. `USE` / `COM_INIT_DB` move the connection.
+- No authentication, no TLS, no prepared statements, and `SET ...` is a no-op. See [`MYSQL_PROTOCOL.md`](MYSQL_PROTOCOL.md) for the exact contract, including type metadata and error pass-through.
+
 ## Authentication & Security
 - **Without `--auth-token`**: Protected by Host allowlist (`--allowed-host-suffixes`, default `db,local,localhost`) and browser CSRF rejection (`Origin` / `Sec-Fetch-Site` -> `403`).
 - **With `--auth-token` / `XSQLD_AUTH_TOKEN`**: Requires `Authorization: Bearer <token>` on all non-`/health` endpoints (`401` on missing/invalid token) in addition to Host checking.
@@ -32,6 +37,7 @@ Databases created directly via the MySQL port (`2881`) are discovered lazily via
 | `--mysql-user` | `XSQLD_MYSQL_USER` | `root` | Database user |
 | `--mysql-password` | `XSQLD_MYSQL_PASSWORD` | `""` | Database password |
 | `--mysql-url` | `XSQLD_MYSQL_URL` | — | Optional full `mysql://...` URL |
+| `--mysql-listen-addr` | — | `127.0.0.1:3306` | MySQL protocol listener; always on, and xsqld exits if the port is taken |
 | `--auth-token` | `XSQLD_AUTH_TOKEN` | — | Optional Bearer token |
 | `--pool-min` / `--pool-max` | — | `2` / `64` | Per-namespace pool bounds |
 | `--pinned-tx-timeout-ms` | — | `5000` | Auto-rollback idle baton transaction |
