@@ -7,6 +7,7 @@ mod exec;
 mod http;
 mod metrics;
 mod mirror;
+mod mysql;
 mod proto;
 mod route;
 mod sql;
@@ -85,12 +86,14 @@ async fn main() -> anyhow::Result<()> {
     let backend = backend::Backend::connect(cfg.clone()).await?;
     let user = tokio::net::TcpListener::bind(cfg.http_listen_addr).await?;
     let admin = tokio::net::TcpListener::bind(cfg.admin_listen_addr).await?;
+    let mysql = tokio::net::TcpListener::bind(cfg.mysql_listen_addr).await?;
 
     tracing::info!(
         version = config::VERSION,
         commit = config::COMMIT,
         http = %cfg.http_listen_addr,
         admin = %cfg.admin_listen_addr,
+        mysql = %cfg.mysql_listen_addr,
         pool_min = cfg.pool_min,
         pool_max = cfg.pool_max,
         auth_enabled = cfg.auth_token.is_some(),
@@ -127,9 +130,10 @@ async fn main() -> anyhow::Result<()> {
         None
     };
     let user_srv = http::serve(user, http::user_router(backend.clone()), cfg.clone(), stop_rx.clone());
-    let admin_srv = http::serve(admin, http::admin_router(backend.clone()), cfg.clone(), stop_rx);
+    let admin_srv = http::serve(admin, http::admin_router(backend.clone()), cfg.clone(), stop_rx.clone());
+    let mysql_srv = mysql::serve(mysql, backend.clone(), cfg.clone(), stop_rx.clone());
     let servers = tokio::spawn(async move {
-        tokio::join!(user_srv, admin_srv);
+        tokio::join!(user_srv, admin_srv, mysql_srv);
     });
 
     shutdown_signal().await;

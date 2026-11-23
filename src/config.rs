@@ -53,6 +53,9 @@ pub struct Config {
     /// Admin API (`/v1/namespaces/<ns>/create`, `DELETE /v1/namespaces/<ns>`, `/health`, `/metrics`)
     #[arg(long, default_value = "127.0.0.1:8081")]
     pub admin_listen_addr: SocketAddr,
+    /// MySQL protocol server for direct MySQL client connections
+    #[arg(long, default_value = "127.0.0.1:3306")]
+    pub mysql_listen_addr: SocketAddr,
 
     /// Accepted for sqld command line compatibility; namespaces are always on
     #[arg(long, hide = true)]
@@ -211,7 +214,7 @@ impl Config {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        for addr in [self.http_listen_addr, self.admin_listen_addr] {
+        for addr in [self.http_listen_addr, self.admin_listen_addr, self.mysql_listen_addr] {
             if !addr.ip().is_loopback() && !self.allow_non_loopback {
                 anyhow::bail!("refusing to listen on non-loopback address {addr} (pass --allow-non-loopback)");
             }
