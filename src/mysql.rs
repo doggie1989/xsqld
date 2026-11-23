@@ -125,16 +125,29 @@ async fn handle_connection(
                     3 => {
                         // COM_QUERY
                         let query = String::from_utf8_lossy(&pkt[1..]).to_string();
-                        if let Err(e) = handle_query(&mut conn, &backend, &cfg, &query).await {
-                            tracing::debug!(query = %query, error = %e, "query error");
-                            let err_pkt = build_err(1064, &format!("Query error: {}", e));
-                            let _ = conn.write_packet(&err_pkt).await;
+                        match handle_query(&mut conn, &backend, &cfg, &query).await {
+                            Ok(()) => {
+                                // Query executed successfully
+                            }
+                            Err(e) => {
+                                tracing::debug!(query = %query, error = %e, "query error");
+                                let err_msg = format!("{}", e);
+                                let code = if err_msg.contains("syntax") { 1064 } else { 1105 };
+                                let err_pkt = build_err(code, &err_msg);
+                                if let Err(e) = conn.write_packet(&err_pkt).await {
+                                    tracing::debug!(error = %e, "failed to send error packet");
+                                    break;
+                                }
+                            }
                         }
                     }
                     _ => {
                         tracing::debug!(command = cmd, "unsupported mysql command");
                         let err_pkt = build_err(1064, "Unsupported command");
-                        let _ = conn.write_packet(&err_pkt).await;
+                        if let Err(e) = conn.write_packet(&err_pkt).await {
+                            tracing::debug!(error = %e, "failed to send error packet");
+                            break;
+                        }
                     }
                 }
             }
@@ -157,12 +170,16 @@ async fn handle_query(
     // Other -> SeekDB only
     if query_lower.starts_with("select") {
         if cfg.mirror_enabled {
-            // Try to execute on DuckDB via mirror
-            // For now, fall back to SeekDB
-            execute_on_seekdb(conn, backend, cfg, query).await?;
-        } else {
-            execute_on_seekdb(conn, backend, cfg, query).await?;
+            // Try DuckDB first; if it fails or mirror is not ready, fall back to SeekDB
+            match try_duckdb(conn, backend, query).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    tracing::debug!(error = %e, "DuckDB routing failed, falling back to SeekDB");
+                    // Fall through to SeekDB
+                }
+            }
         }
+        execute_on_seekdb(conn, backend, cfg, query).await?;
     } else {
         // INSERT, UPDATE, DELETE, DDL -> always go to SeekDB
         execute_on_seekdb(conn, backend, cfg, query).await?;
@@ -171,24 +188,91 @@ async fn handle_query(
     Ok(())
 }
 
-async fn execute_on_seekdb(
+async fn try_duckdb(
     conn: &mut MysqlConnection,
     backend: &Arc<Backend>,
-    _cfg: &Arc<Config>,
     _query: &str,
 ) -> Result<()> {
-    // Get a connection from the default namespace pool
+    // Get namespace and check if mirror is available
     let ns = "default";
-    let _ns_pool = backend
+    let ns_pool = backend
         .get_namespace(ns)
         .await
         .context("failed to get namespace")?
         .context("namespace not found")?;
 
-    // For now, just send OK
-    // TODO: Properly execute query and return result set
-    let ok_pkt = build_ok(1, 0);
-    conn.write_packet(&ok_pkt).await?;
+    let mirror_view = ns_pool
+        .mirror
+        .read()
+        .clone()
+        .context("mirror not available")?;
+
+    // For now, return error to trigger fallback to SeekDB
+    // TODO: Execute query on DuckDB via mirror
+    bail!("DuckDB routing not yet implemented")
+}
+
+async fn execute_on_seekdb(
+    conn: &mut MysqlConnection,
+    backend: &Arc<Backend>,
+    _cfg: &Arc<Config>,
+    query: &str,
+) -> Result<()> {
+    // Get a connection from the default namespace pool
+    let ns = "default";
+    let ns_pool = backend
+        .get_namespace(ns)
+        .await
+        .context("failed to get namespace")?
+        .context("namespace not found")?;
+
+    let mut mysql_conn = ns_pool
+        .pool
+        .get_conn()
+        .await
+        .context("failed to get mysql connection")?;
+
+    // Execute query
+    use mysql_async::prelude::Queryable;
+
+    match mysql_conn.query_iter(query).await {
+        Ok(result) => {
+            // Get column information
+            let columns: Vec<_> = result.columns().iter().cloned().collect();
+
+            // Send column definition packets
+            send_column_definitions(conn, &columns).await?;
+
+            // Send EOF after columns
+            send_eof(conn).await?;
+
+            // Collect and send rows
+            let mut row_count = 0u64;
+            for row_result in result {
+                match row_result {
+                    Ok(row) => {
+                        send_row(conn, &row).await?;
+                        row_count += 1;
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "error reading row");
+                        return Err(e.into());
+                    }
+                }
+            }
+
+            // Send EOF after rows
+            send_eof(conn).await?;
+
+            tracing::debug!(row_count = row_count, "query executed");
+        }
+        Err(e) => {
+            // Query execution failed
+            let err_msg = format!("{}", e);
+            let code = if err_msg.contains("syntax") { 1064 } else { 1105 };
+            return Err(anyhow::anyhow!("Query error ({}): {}", code, err_msg));
+        }
+    }
 
     Ok(())
 }
@@ -246,5 +330,90 @@ fn encode_lenenc_int(buf: &mut Vec<u8>, val: u64) {
         buf.put_u8(0xfe);
         buf.put_u64_le(val);
     }
+}
+
+fn encode_lenenc_str(buf: &mut Vec<u8>, s: &[u8]) {
+    encode_lenenc_int(buf, s.len() as u64);
+    buf.put_slice(s);
+}
+
+async fn send_column_definitions(
+    conn: &mut MysqlConnection,
+    columns: &[mysql_async::Column],
+) -> Result<()> {
+    // Send column count
+    let mut pkt = Vec::new();
+    encode_lenenc_int(&mut pkt, columns.len() as u64);
+    conn.write_packet(&pkt).await?;
+
+    // Send each column definition
+    for col in columns {
+        let mut col_pkt = Vec::new();
+
+        // Catalog
+        encode_lenenc_str(&mut col_pkt, b"def");
+
+        // Database
+        encode_lenenc_str(&mut col_pkt, b"");
+
+        // Table
+        encode_lenenc_str(&mut col_pkt, col.table().as_bytes());
+
+        // Original table
+        encode_lenenc_str(&mut col_pkt, col.table().as_bytes());
+
+        // Name
+        encode_lenenc_str(&mut col_pkt, col.name_str().as_bytes());
+
+        // Original name
+        encode_lenenc_str(&mut col_pkt, col.name_str().as_bytes());
+
+        // Charset
+        col_pkt.put_u8(0x0c);
+        col_pkt.put_u24_le(63); // utf8mb4
+
+        // Column length
+        col_pkt.put_u32_le(1024);
+
+        // Type
+        col_pkt.put_u8(0xfd); // VARCHAR
+
+        // Flags
+        col_pkt.put_u16_le(0);
+
+        // Decimals
+        col_pkt.put_u8(0);
+
+        // Filler
+        col_pkt.put_u16_le(0);
+
+        conn.write_packet(&col_pkt).await?;
+    }
+
+    Ok(())
+}
+
+async fn send_row(conn: &mut MysqlConnection, row: &mysql_async::Row) -> Result<()> {
+    let mut pkt = Vec::new();
+
+    for i in 0..row.len() {
+        if let Some(val) = row.get::<String, _>(i) {
+            encode_lenenc_str(&mut pkt, val.as_bytes());
+        } else {
+            pkt.put_u8(0xfb); // NULL
+        }
+    }
+
+    conn.write_packet(&pkt).await?;
+    Ok(())
+}
+
+async fn send_eof(conn: &mut MysqlConnection) -> Result<()> {
+    let mut pkt = Vec::new();
+    pkt.put_u8(0xfe); // EOF header
+    pkt.put_u16_le(0); // warnings
+    pkt.put_u16_le(0x0002); // status flags
+    conn.write_packet(&pkt).await?;
+    Ok(())
 }
 
