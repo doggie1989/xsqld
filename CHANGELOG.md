@@ -9,6 +9,52 @@ All notable changes to xsqld are documented in this file. The format is based on
 exposes them as `xsqld_build_info{version="…",commit="…"} 1`. Builds outside a git checkout can set
 `XSQLD_GIT_COMMIT`; without it and without git the commit reads `unknown`.
 
+## [Unreleased]
+
+The MySQL listener of 1.1.0 hung the official `mysql` CLI on the first `SELECT`, and lost the session
+state a MySQL client expects to keep. Both are fixed, and both are now covered by tests that use real
+clients rather than a mock.
+
+### Fixed
+
+- **`mysql -e "SELECT 1"` never returned.** With `CLIENT_DEPRECATE_EOF` negotiated the listener sent an
+  extra EOF after the column definitions and an OK instead of the EOF that ends the rows;
+  `libmysqlclient` read the terminator as a row and waited forever. It now sends what mysqld 8.4 sends:
+  `column_count` definitions, no terminator, rows, one EOF (`fe 00 00 02 00 00 00`). Classic clients
+  that did not negotiate the flag still get the EOF after the definitions.
+- **Session state survived only by accident.** Statements were run on whichever pooled backend
+  connection was free, so `LAST_INSERT_ID()` answered 0 where the backend answered 2, `SET @a=5` left
+  `SELECT @a` NULL, and SQL-level `PREPARE` failed with 1243. One client connection now holds one
+  backend connection for its whole session, as a mysqld server thread does.
+- `cargo clippy --all-targets -- -D warnings` failed on a deprecated atomic helper, so the Docker build
+  recipe in README could not finish a release. The rename it asks for (`try_update`) is stable only
+  since 1.95, past this crate's 1.91 MSRV, so the call keeps its old name under a scoped
+  `#[allow(deprecated)]`.
+
+### Changed
+
+- `USE` / `COM_INIT_DB` gives the held connection back, because it belongs to the old namespace's pool
+  and a transaction cannot move between backend connections. An open transaction is therefore rolled
+  back by the switch rather than carried into the new schema.
+- A disconnect releases the session's backend connection instead of waiting for the reaper, on the
+  error paths as well as on `COM_QUIT` -- a client that resets its TCP connection would otherwise have
+  kept the pool slot forever, since an idle session is exempt from `--pinned-tx-timeout-ms` sweeping.
+  `--pool-max` (default 64 per namespace) is now the bound on concurrent MySQL sessions.
+- `SET ...` was always forwarded, but it took effect on a connection the client never saw again. With
+  the session pinned it holds: user variables, `@@` writes and `SET autocommit` apply for the rest of
+  the connection, and are gone when the connection moves schema or ends.
+
+### Added
+
+- `tests/test_mysql_cli.py`: drives the official `mysql` CLI against a server it starts itself, and uses
+  the raw backend on the same port range as the reference oracle for `PREPARE`/`EXECUTE`,
+  `LAST_INSERT_ID()` and variable parity. The DEPRECATE_EOF hang and the session-state loss both
+  reproduce against 1.1.0 in this suite.
+- Raw protocol assertions for the negotiated framing, `COM_STMT_PREPARE` → 1047, multi-statement →
+  1064, a 2^24-1 byte `COM_QUERY` reassembled before it runs, and `xsqld_pinned_streams` returning to
+  its baseline after a client resets its connection instead of sending `COM_QUIT`.
+- `MYSQL_PROTOCOL.md` and README describe the framing and session semantics the tests now prove.
+
 ## [0.1.4] - 2026-11-13
 
 Databases take threads only while they have work, and unused databases are closed. Before, every open database

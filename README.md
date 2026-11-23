@@ -23,7 +23,8 @@ Databases created directly via the MySQL port (`2881`) are discovered lazily via
 ### MySQL protocol port (`--mysql-listen-addr`, default `127.0.0.1:3306`)
 - MySQL wire protocol (HandshakeV10, text result sets) for `mysql` CLI, ORMs, BI tools and any client that speaks the protocol. Statements go through the same pipeline as `POST /v2/pipeline`, so HTAP routing, budgets, transactions and metrics apply identically.
 - The schema *is* the namespace: `-D myns` (or the username when no database is given) selects it, and an unknown name is refused during the handshake. `USE` / `COM_INIT_DB` move the connection.
-- No authentication, no TLS, no prepared statements, and `SET ...` is a no-op. See [`MYSQL_PROTOCOL.md`](MYSQL_PROTOCOL.md) for the exact contract, including type metadata and error pass-through.
+- One client connection is one backend connection for its whole session, like a mysqld server thread: `BEGIN`/`COMMIT`/`ROLLBACK`, `LAST_INSERT_ID()`, user variables, `@@`, and SQL-level `PREPARE`/`EXECUTE` all behave. `--pool-max` therefore bounds concurrent MySQL sessions.
+- No authentication and no TLS; binary prepared statements (`COM_STMT_PREPARE`) are refused with `1047`. See [`MYSQL_PROTOCOL.md`](MYSQL_PROTOCOL.md) for the exact contract, including DEPRECATE_EOF framing, type metadata and error pass-through.
 
 ## Authentication & Security
 - **Without `--auth-token`**: Protected by Host allowlist (`--allowed-host-suffixes`, default `db,local,localhost`) and browser CSRF rejection (`Origin` / `Sec-Fetch-Site` -> `403`).
@@ -40,7 +41,7 @@ Databases created directly via the MySQL port (`2881`) are discovered lazily via
 | `--mysql-listen-addr` | — | `127.0.0.1:3306` | MySQL protocol listener; always on, and xsqld exits if the port is taken |
 | `--auth-token` | `XSQLD_AUTH_TOKEN` | — | Optional Bearer token |
 | `--pool-min` / `--pool-max` | — | `2` / `64` | Per-namespace pool bounds |
-| `--pinned-tx-timeout-ms` | — | `5000` | Auto-rollback idle baton transaction |
+| `--pinned-tx-timeout-ms` | — | `5000` | Auto-rollback a transaction held idle, by an HTTP baton or by a MySQL session |
 | `--request-timeout-ms` | — | `40000` | Pipeline deadline (+ `KILL QUERY` on backend) |
 
 ## Columnar mirror (opt-in HTAP)
@@ -102,3 +103,10 @@ docker run --rm \
   -e CARGO_TARGET_DIR=/tmp/cargo-target \
   rust:latest sh -c 'cargo test && cargo clippy --all-targets -- -D warnings && cargo build --release'
 ```
+
+## Tests
+
+`cargo test` covers the gateway logic. The protocol itself is checked against real clients and a real
+backend by four Python suites (`tests/test_mysql_protocol.py`, `test_mysql_e2e.py`, `test_mysql_cli.py`,
+`test_mysql_route.py`) — see the Tests section of [`MYSQL_PROTOCOL.md`](MYSQL_PROTOCOL.md) for how to
+run them and what each one assumes.

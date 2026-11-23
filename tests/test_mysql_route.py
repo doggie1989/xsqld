@@ -42,8 +42,10 @@ GATEWAY = f"http://127.0.0.1:{HTTP_PORT}"
 ADMIN = f"http://127.0.0.1:{ADMIN_PORT}"
 
 # -D selects the namespace, exactly as a client would do it
+# autocommit on purpose: a driver defaults it to off, and then its writes legitimately stay
+# invisible to the backend session until COMMIT -- which also keeps them out of the mirror.
 LISTENER = dict(host=BACKEND_HOST, port=LISTEN_PORT, user=BACKEND_USER, password="",
-                database=NS, connect_timeout=15)
+                database=NS, connect_timeout=15, autocommit=True)
 DIRECT = dict(host=BACKEND_HOST, port=BACKEND_PORT, user=BACKEND_USER,
               password=BACKEND_PASSWORD, autocommit=True)
 

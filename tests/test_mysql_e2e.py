@@ -33,8 +33,11 @@ BACKEND_USER = os.environ.get("XS_BACKEND_USER", "root")
 BACKEND_PASSWORD = os.environ.get("XS_BACKEND_PASSWORD", "")
 HTTP_HOST, HTTP_PORT = "127.0.0.1", int(os.environ.get("XS_HTTP_PORT", "8090"))
 
+# autocommit on purpose: a driver defaults it to off, and since a MySQL connection now keeps one
+# backend connection for its whole session, an uncommitted write stays invisible to the backend
+# session this test compares against. The explicit transactions below opt back out.
 LISTENER = dict(host="127.0.0.1", port=LISTEN_PORT, user="default", password="",
-                database=NS, connect_timeout=15)
+                database=NS, connect_timeout=15, autocommit=True)
 DIRECT = dict(host="127.0.0.1", port=BACKEND_PORT, user=BACKEND_USER,
               password=BACKEND_PASSWORD, autocommit=True)
 
@@ -211,7 +214,7 @@ def main():
 
         # transactions: BEGIN has to keep holding this session's backend connection. If it does not,
         # every statement runs in its own transaction, ROLLBACK reports OK and undoes nothing.
-        txn = pymysql.connect(**LISTENER, autocommit=False)
+        txn = pymysql.connect(**{**LISTENER, "autocommit": False})
         tcur = txn.cursor()
         tcur.execute("DROP TABLE IF EXISTS txnprobe")
         tcur.execute("CREATE TABLE txnprobe(id INT PRIMARY KEY, v VARCHAR(8))")
@@ -232,6 +235,17 @@ def main():
         tcur.execute("SELECT COUNT(*) FROM txnprobe")
         committed = tcur.fetchall()[0][0]
         rec("COMMIT keeps the write", committed == 1, str(committed))
+
+        # switching schema cannot carry a transaction: the held backend connection belongs to the
+        # old namespace, so mysqld's rule applies and the open transaction is rolled back, not moved.
+        tcur.execute("BEGIN")
+        tcur.execute("INSERT INTO marker VALUES ('carried')")
+        tcur.execute(f"USE {peer}")
+        tcur.execute("SELECT 1")
+        tcur.execute(f"USE {NS}")
+        tcur.execute("SELECT COUNT(*) FROM marker WHERE where_i_am='carried'")
+        carried = tcur.fetchall()[0][0]
+        rec("USE rolls back an open transaction instead of moving it", carried == 0, str(carried))
 
         tcur.execute("BEGIN")
         tcur.execute("INSERT INTO txnprobe VALUES (3,'c')")

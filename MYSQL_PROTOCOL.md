@@ -33,7 +33,7 @@ of being treated as a switch.
 | Commands | `COM_QUERY`, `COM_INIT_DB`, `COM_PING`, `COM_QUIT`. Anything else → 1047 `ER_UNKNOWN_COM_ERROR`. |
 | Protocol | HandshakeV10, 4.1 capability negotiation, `mysql_native_password` (the token is read and ignored — there is no authentication yet). |
 | Capabilities | `0x01088209`: LONG_PASSWORD, CONNECT_WITH_DB, PROTOCOL_41, SECURE_CONNECTION, PLUGIN_AUTH, DEPRECATE_EOF. |
-| Result sets | Text protocol. Column definitions carry the full `0x0c` fixed block (charset, column length, type, flags, decimals). EOF packets are used unless the client negotiated DEPRECATE_EOF, in which case OK packets replace them. |
+| Result sets | Text protocol. Column definitions carry the full `0x0c` fixed block (charset, column length, type, flags, decimals). With DEPRECATE_EOF negotiated the listener sends `column_count` definitions and then the rows with no terminator in between, and ends the rows with an EOF packet (`fe 00 00 02 00 00 00`) -- exactly what mysqld 8.4 puts on the wire. Classic clients, which count the definitions themselves and expect one more packet before the first row, additionally get the EOF after the column definitions. |
 | Packets | Chunked at 2^24-1 bytes and reassembled; a message is capped at 256 MB. |
 | Errors | The backend's own errno and SQLSTATE reach the client (e.g. `1146 / #42S02` for a missing table). Gateway-level failures get 1205 for a deadline, 1049 for an unavailable namespace, 1047 for an expired stream, 1105 otherwise. |
 
@@ -52,36 +52,56 @@ Values are length-encoded raw bytes. Blob bytes are sent as they are, with no es
 containing `0x00`, `0x1a`, a backslash or a quote arrives intact. Text columns advertise a text
 collation, not the binary one, so clients decode them as strings instead of handing back bytes.
 
-## Transactions
+## Transactions and session state
 
 `BEGIN` / `START TRANSACTION`, `COMMIT` and `ROLLBACK` work. One TCP connection is one gateway
-stream, so a transaction pins its backend connection for the whole session: reads inside it see
-their own writes, another session does not see them, and `ROLLBACK` really undoes them. Inside a
-transaction nothing is routed to the DuckDB mirror — the mirror is not part of the snapshot the
-transaction is reading.
+stream *and* one backend connection, held for the whole life of the client session -- the way mysqld
+maps a connection onto a server thread. That is what makes the session-state functions meaningful:
+`LAST_INSERT_ID()`, `CONNECTION_ID()`, user variables (`SET @a=5; SELECT @a`), `@@` reads and writes,
+and SQL-level `PREPARE`/`EXECUTE`/`DEALLOCATE` all refer to the same backend connection the next
+statement of this client will use. Reads inside a transaction see their own writes, another session
+does not see them, and `ROLLBACK` really undoes them. Inside a transaction nothing is routed to the
+DuckDB mirror -- the mirror is not part of the snapshot the transaction is reading.
 
-A client that dies without committing does not hang the pool: the reaper rolls the transaction
-back and disconnects it after `--pinned-tx-timeout-ms` (default 5000), counted by
+Because a statement no longer borrows an arbitrary connection from the pool, a client that leaves a
+write uncommitted (the default in `pymysql`, `mysql-connector` and JDBC when autocommit is off) keeps
+it invisible until `COMMIT` -- including invisible to the mirror, which is fed from the backend's
+own committed state.
+
+Two consequences are worth knowing:
+
+* `--pool-max` (default 64, per namespace) now bounds the number of concurrent MySQL sessions, not
+  the number of in-flight statements. A session that goes away releases its connection immediately;
+  an idle session does not time out and holds one slot until the client disconnects.
+* `USE <db>` / `COM_INIT_DB` hands the held connection back, because it belongs to the old
+  namespace's pool and a transaction cannot move between backend connections. An open transaction is
+  therefore rolled back by the switch, and session variables and prepared statements set beforehand
+  are gone with it.
+
+A client that dies without committing does not hang the pool: `release_stream` rolls the transaction
+back before the connection goes back, and the reaper catches anything left over after
+`--pinned-tx-timeout-ms` (default 5000), counted by
 `xsqld_pinned_timeout_rollbacks_total`.
 
 ## Statements the listener does not run as written
 
-* **`SET ...`** is answered with OK and otherwise ignored. Session variables would have to apply to
-  a backend connection that is shared with other clients and may be reused at any moment;
-  applying them would leak one client's settings into another's.
 * **Multiple statements in one `COM_QUERY`** are refused with 1064 before reaching the backend.
   The gateway executes one statement per request, and silently running only the first would be
-  worse than saying no.
-* **Prepared statements** (`COM_STMT_PREPARE`, `COM_STMT_EXECUTE`) are not implemented. Most
-  clients default to `COM_QUERY` (pymysql always, mysql-connector/JDBC unless
-  `useServerPrepStmts`/`prepared_statement` is turned on); those that insist must be configured
-  not to prepare.
+  worse than saying no. The `mysql` CLI splits its own input, so scripts and `-e "a; b"` are
+  unaffected; a client that sends a literal multi-statement packet (JDBC
+  `allowMultiQueries=true`) has to be configured not to.
+* **Binary prepared statements** (`COM_STMT_PREPARE`, `COM_STMT_EXECUTE`) are refused with 1047
+  `ER_UNSUPPORTED_PS` rather than left hanging. Most clients default to `COM_QUERY` (pymysql always,
+  mysql-connector/JDBC unless `useServerPrepStmts`/`prepared_statement` is turned on); those that
+  insist must be configured not to prepare. SQL-level `PREPARE`/`EXECUTE`/`DEALLOCATE` are ordinary
+  statements and do work, because they run on this session's backend connection.
 * **TLS**: refused with 1251 `ER_NOT_SUPPORTED_YET` against the real reason, not a garbled
   handshake. Connect with `--ssl-mode=DISABLED` (mysql CLI) or `ssl_mode=DISABLED`.
 * `SHOW TABLES`, `SHOW DATABASES`, `SELECT @@sql_mode`, `EXPLAIN` and `DO` are forwarded to the
   backend, so they report the backend's state. That includes `xsqld_changelog`, the outbox the
   mirror is fed from, and `CONNECTION_ID()`, which is the *backend* connection id rather than a
-  session id.
+  gateway session id -- stable for the whole client session now, and identifying one session out of
+  `--pool-max` of them.
 
 ## Routing through the listener
 
@@ -112,28 +132,51 @@ mysql -h 127.0.0.1 -P 3306 -u default -D myns --ssl-mode=DISABLED -e "SELECT COU
 
 ## Tests
 
-Three suites, all against a real backend; they do not mock the protocol.
+Four suites, all against a real backend; none of them mocks the protocol.
 
 ```bash
 cargo test                                              # unit tests, incl. packet framing and USE parsing
 
-python3 tests/test_mysql_protocol.py                    # raw socket client: byte-exact handshake,
-                                                        # EOF vs DEPRECATE_EOF, errno+SQLSTATE, chunking
+python3 tests/test_mysql_protocol.py                    # hand-written socket client: byte-exact handshake,
+                                                        # EOF vs DEPRECATE_EOF framing, errno+SQLSTATE,
+                                                        # multi-packet queries in both directions, and a
+                                                        # client that resets instead of quitting
 python3 tests/test_mysql_e2e.py                         # pymysql: types, blobs, HTTP/MySQL parity,
                                                         # USE and COM_INIT_DB, transactions, errors
+python3 tests/test_mysql_cli.py                         # the official mysql CLI, which spawns its own
+                                                        # xsqld: regression for the DEPRECATE_EOF hang,
+                                                        # session state, and parity vs the raw backend
 python3 tests/test_mysql_route.py                       # spawns xsqld with the mirror on and proves
                                                         # the listener's SELECTs are routed
 
 # env: XS_BACKEND_PORT (default 12981), XS_BACKEND_USER, XS_BACKEND_PASSWORD,
-#      XS_MYSQL_PORT (default 3308), XS_HTTP_PORT, XS_ADMIN_PORT, XS_NAMESPACE, XS_BIN
+#      XS_MYSQL_PORT (default 3308), XS_HTTP_PORT, XS_ADMIN_PORT, XS_NAMESPACE, XS_BIN, MYSQL_CLI
 ```
 
-`test_mysql_route.py` starts its own `xsqld` because routing needs flags the default server does
-not have (`--mirror-enabled`, and `--route-min-rows` far below the 200000 default).
+`test_mysql_route.py` and `test_mysql_cli.py` start their own `xsqld` because they need flags the
+default server does not have (`--mirror-enabled`, and `--route-min-rows` far below the 200000
+default). The other two assume a running server; the usual local setup is
+
+```bash
+cargo run -- --mysql-host 127.0.0.1 --mysql-port 12981 --mysql-user root \
+  --http-listen-addr 127.0.0.1:8090 --admin-listen-addr 127.0.0.1:8091 \
+  --mysql-listen-addr 127.0.0.1:3308
+curl -X POST http://127.0.0.1:8091/v1/namespaces/xs/create \
+  -H 'Content-Type: application/json' -d '{}'
+```
+
+The driver suites deliberately connect with `autocommit=True`: a session now keeps its own backend
+connection, so a driver that defaults autocommit off leaves its writes uncommitted and they are
+correctly invisible to the backend session the test compares against.
 
 ## Limitations
 
-No authentication, no TLS, no prepared statements, no session variables. The listener shares the
-gateway's stream semantics, so a MySQL session is a stream: it is subject to
-`--stream-idle-ms`/`--pinned-tx-timeout-ms` sweeping, and a session that is idle long enough loses
-an open transaction (the next statement gets `Stream expired`, 1047).
+No authentication (the `mysql_native_password` token is read and discarded), no TLS, no binary
+prepared statements. Everything else a session needs is the backend's own: `SET`, user variables,
+`@@`, `LAST_INSERT_ID()` and SQL-level `PREPARE` are honoured because the session keeps one backend
+connection.
+
+A MySQL session is not an Hrana stream: it is exempt from `--stream-idle-ms` and lives until the
+client disconnects, which is why `--pool-max` bounds concurrency. An *open transaction* is still
+swept: after `--pinned-tx-timeout-ms` the connection is rolled back and taken away, and the next
+statement of that session gets `Stream expired` (1047).

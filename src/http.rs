@@ -387,7 +387,17 @@ async fn pipeline(
     let routed_before = ns_pool.metrics.routed.load(std::sync::atomic::Ordering::Relaxed);
     let deadline = started + app.cfg.request_timeout();
     let outcome = app
-        .run_pipeline(&ns_pool, lease.id, lease.pinned, req.requests, deadline)
+        .run_pipeline(
+            &ns_pool,
+            lease.id,
+            crate::backend::StreamState {
+                held: lease.pinned,
+                in_trans: lease.pinned,
+                session: false,
+            },
+            req.requests,
+            deadline,
+        )
         .await;
     let elapsed = started.elapsed();
     if elapsed.as_millis() >= 1000 {
@@ -407,6 +417,7 @@ async fn pipeline(
             results,
             closed,
             pinned,
+            ..
         } => {
             let baton = app.streams.finish(lease, closed, pinned);
             axum::Json(PipelineResp {

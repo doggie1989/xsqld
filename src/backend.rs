@@ -37,11 +37,27 @@ impl fmt::Display for AdminError {
     }
 }
 
+/// What the client tells the gateway about the stream a pipeline belongs to.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StreamState {
+    /// The client believes a backend connection is still held for this stream id.
+    pub held: bool,
+    /// A transaction is open on that connection.
+    pub in_trans: bool,
+    /// Keep one backend connection for the whole client session, not only while a transaction is
+    /// open. `LAST_INSERT_ID()`, user variables and SQL-level `PREPARE` are session state, so a
+    /// MySQL connection that moved between backend connections per statement would silently lose it.
+    pub session: bool,
+}
+
 pub enum Outcome {
     Done {
         results: Vec<StreamResult>,
         closed: bool,
+        /// The gateway kept (or took) a backend connection for this stream.
         pinned: bool,
+        /// Whether a transaction is open on it after this pipeline.
+        in_trans: bool,
     },
     StreamExpired,
     Deadline,
@@ -83,6 +99,9 @@ struct PinnedTx {
     ns: Arc<str>,
     conn: Conn,
     last_used: Instant,
+    /// Held for a MySQL session rather than an open transaction: the reaper must not roll it back
+    /// just because the client paused between two statements.
+    session: bool,
 }
 
 pub struct Backend {
@@ -269,14 +288,14 @@ impl Backend {
         &self,
         ns_pool: &Arc<NsPool>,
         stream_id: u64,
-        was_pinned: bool,
+        state: StreamState,
         requests: Vec<StreamRequest>,
         deadline: Instant,
     ) -> Outcome {
         ns_pool.touch(self.origin);
         ns_pool.metrics.requests.fetch_add(1, Ordering::Relaxed);
 
-        if !was_pinned && requests.iter().all(|r| matches!(r, StreamRequest::Close)) {
+        if !state.held && requests.iter().all(|r| matches!(r, StreamRequest::Close)) {
             return Outcome::Done {
                 results: requests
                     .iter()
@@ -286,6 +305,7 @@ impl Backend {
                     .collect(),
                 closed: !requests.is_empty(),
                 pinned: false,
+                in_trans: false,
             };
         }
 
@@ -298,7 +318,7 @@ impl Backend {
             return Outcome::Deadline;
         };
 
-        let mut conn = if was_pinned {
+        let mut conn = if state.held {
             let maybe = self.pinned.lock().await.remove(&stream_id);
             match maybe {
                 Some(p) => {
@@ -336,7 +356,7 @@ impl Backend {
         match exec::run(
             &mut conn,
             &requests,
-            was_pinned,
+            state.in_trans,
             self.cfg.max_response_bytes,
             deadline,
             &ns_pool.metrics,
@@ -366,8 +386,9 @@ impl Backend {
                         results: er.results,
                         // If a pinned transaction lost its underlying TCP stream, terminate the baton
                         // so the client knows the transaction died and must open a fresh stream.
-                        closed: er.closed || was_pinned,
+                        closed: er.closed || state.held,
                         pinned: false,
+                        in_trans: false,
                     };
                 }
 
@@ -377,10 +398,11 @@ impl Backend {
                         results: er.results,
                         closed: true,
                         pinned: false,
+                        in_trans: false,
                     };
                 }
 
-                if er.in_trans {
+                if er.in_trans || state.session {
                     ns_pool.metrics.pinned_streams.fetch_add(1, Ordering::Relaxed);
                     self.pinned.lock().await.insert(
                         stream_id,
@@ -388,12 +410,14 @@ impl Backend {
                             ns: ns_pool.name.clone(),
                             conn,
                             last_used: Instant::now(),
+                            session: state.session && !er.in_trans,
                         },
                     );
                     return Outcome::Done {
                         results: er.results,
                         closed: false,
                         pinned: true,
+                        in_trans: er.in_trans,
                     };
                 }
 
@@ -402,6 +426,7 @@ impl Backend {
                     results: er.results,
                     closed: false,
                     pinned: false,
+                    in_trans: er.in_trans,
                 }
             }
         }
@@ -492,7 +517,7 @@ impl Backend {
             let mut g = self.pinned.lock().await;
             let ids: Vec<u64> = g
                 .iter()
-                .filter_map(|(&id, p)| (now.duration_since(p.last_used) >= limit).then_some(id))
+                .filter_map(|(&id, p)| (!p.session && now.duration_since(p.last_used) >= limit).then_some(id))
                 .collect();
             ids.into_iter()
                 .filter_map(|id| g.remove(&id).map(|p| (id, p)))
@@ -507,6 +532,27 @@ impl Backend {
             }
             tracing::warn!(ns = &*p.ns, stream_id = id, "rolled back expired pinned transaction");
             cleanup_and_disconnect(p.conn).await;
+        }
+    }
+
+    /// Gives back the backend connection a MySQL client was holding, when that client goes away.
+    /// Without this a disconnect would leak the pool slot until the transaction reaper took it.
+    pub async fn release_stream(&self, stream_id: u64) {
+        let Some(p) = self.pinned.lock().await.remove(&stream_id) else {
+            return;
+        };
+        if let Some(np) = self.namespaces.read().get(&*p.ns).cloned() {
+            dec_non_neg(&np.metrics.pinned_streams);
+        }
+        let mut conn = p.conn;
+        // A client that quit after BEGIN must not hand an open transaction to the next borrower.
+        // ROLLBACK with no transaction is a no-op on the server, so it is safe to send blind; if the
+        // exchange itself failed the stream is unusable and gets disconnected instead of pooled.
+        let rolled_back = tokio::time::timeout(Duration::from_secs(2), conn.query_drop("ROLLBACK")).await;
+        if rolled_back.is_ok_and(|r| r.is_ok()) {
+            drop(conn);
+        } else {
+            let _ = tokio::time::timeout(Duration::from_secs(1), conn.disconnect()).await;
         }
     }
 
@@ -554,6 +600,9 @@ impl Backend {
     }
 }
 
+/// Decrements a gauge without letting it go negative: the count is per namespace pool, so a stray
+/// decrement must not turn a reported gauge into a negative number.
+#[allow(deprecated)] // `fetch_update` is renamed `try_update` only since 1.95; this crate holds 1.91
 fn dec_non_neg(a: &AtomicI64) {
     let _ = a.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some((v - 1).max(0)));
 }

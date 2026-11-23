@@ -49,12 +49,15 @@ static STREAM_IDS: AtomicU64 = AtomicU64::new(1);
 struct MysqlConnection {
     stream: TcpStream,
     seq_id: u8,
-    /// One id per MySQL connection so a transaction cannot collide with another connection's pinned stream.
+    /// One id per MySQL connection so a session cannot collide with another connection's stream.
     stream_id: u64,
     deprecate_eof: bool,
-    /// True while the gateway holds a backend connection for this client's open transaction. A MySQL
-    /// session is one stream, so BEGIN has to keep its connection until COMMIT or ROLLBACK.
-    pinned: bool,
+    /// True while the gateway holds a backend connection for this client. A MySQL session is one
+    /// server thread, so `LAST_INSERT_ID()`, `@vars` and SQL-level `PREPARE` only work if every
+    /// statement of a connection runs on the same backend connection.
+    held: bool,
+    /// True while a transaction is open on it; decides whether a SELECT may be routed to the mirror.
+    in_trans: bool,
 }
 
 impl MysqlConnection {
@@ -64,7 +67,17 @@ impl MysqlConnection {
             seq_id: 0,
             stream_id: STREAM_IDS.fetch_add(1, Ordering::Relaxed),
             deprecate_eof: false,
-            pinned: false,
+            held: false,
+            in_trans: false,
+        }
+    }
+
+    /// Hands back the backend connection when the session moves elsewhere or ends.
+    async fn drop_session(&mut self, backend: &Backend) {
+        if self.held {
+            backend.release_stream(self.stream_id).await;
+            self.held = false;
+            self.in_trans = false;
         }
     }
 
@@ -144,15 +157,19 @@ impl MysqlConnection {
         self.write_packet(&pkt).await
     }
 
-    async fn eof_or_ok(&mut self) -> io::Result<()> {
+    /// End of the column definitions. A client that negotiated `CLIENT_DEPRECATE_EOF` counts
+    /// `column_count` packets itself and expects the next packet to be the first row, so nothing is
+    /// sent; classic clients need the terminator.
+    async fn metadata_terminator(&mut self) -> io::Result<()> {
         if self.deprecate_eof {
-            return self.ok(0, 0).await;
+            return Ok(());
         }
-        let mut pkt = Vec::new();
-        pkt.put_u8(0xfe);
-        pkt.put_u16_le(0);
-        pkt.put_u16_le(SERVER_STATUS_NO_TRANSACTIONS);
-        self.write_packet(&pkt).await
+        self.eof().await
+    }
+
+    /// End of the rows. Always an EOF packet, matching what mysqld puts on the wire.
+    async fn eof(&mut self) -> io::Result<()> {
+        self.write_packet(&[0xfe, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00]).await
     }
 
     async fn columns(&mut self, cols: &[Col]) -> io::Result<()> {
@@ -179,7 +196,7 @@ impl MysqlConnection {
             pkt.put_u16_le(0);
             self.write_packet(&pkt).await?;
         }
-        self.eof_or_ok().await
+        self.metadata_terminator().await
     }
 
     async fn rows(&mut self, rows: &[Vec<Value>]) -> io::Result<()> {
@@ -190,7 +207,7 @@ impl MysqlConnection {
             }
             self.write_packet(&pkt).await?;
         }
-        self.eof_or_ok().await
+        self.eof().await
     }
 }
 
@@ -261,41 +278,57 @@ async fn handle_connection(stream: TcpStream, backend: Arc<Backend>, cfg: Arc<Co
     conn.ok(0, 0).await?;
 
     buf.clear();
-    loop {
-        let Some(pkt) = conn.read_message(&mut buf).await? else {
-            break;
-        };
-        let Some(&cmd) = pkt.first() else {
-            continue;
-        };
-        match cmd {
-            COM_QUIT => break,
-            COM_INIT_DB => {
-                let ns = String::from_utf8_lossy(&pkt[1..]).to_string();
-                let switched = switch_namespace(&mut namespace, &ns, &backend).await;
-                reply_switch(&mut conn, switched).await?;
-            }
-            COM_QUERY => {
-                let query = String::from_utf8_lossy(&pkt[1..]).to_string();
-                // A schema is the namespace here, so `USE` has to move this connection. Forwarding it
-                // would report success while the gateway kept qualifying names with the old namespace,
-                // which reads the wrong schema silently.
-                if let Some(target) = use_target(&query) {
-                    let switched = switch_namespace(&mut namespace, target, &backend).await;
+    // The loop runs in a block so the session is handed back on a read error too: a client that
+    // unplugs rather than sending COM_QUIT would otherwise keep its backend connection forever,
+    // since an idle session is deliberately exempt from the transaction reaper.
+    let ran: Result<()> = async {
+        loop {
+            let Some(pkt) = conn.read_message(&mut buf).await? else {
+                break;
+            };
+            let Some(&cmd) = pkt.first() else {
+                continue;
+            };
+            match cmd {
+                COM_QUIT => break,
+                COM_INIT_DB => {
+                    let ns = String::from_utf8_lossy(&pkt[1..]).to_string();
+                    let switched = switch_namespace(&mut namespace, &ns, &backend).await;
+                    if switched.is_ok() {
+                        conn.drop_session(&backend).await;
+                    }
                     reply_switch(&mut conn, switched).await?;
-                    continue;
                 }
-                if let Err(e) = run_statement(&mut conn, &backend, &cfg, &namespace, &query).await {
-                    tracing::debug!(ns = %namespace, query = %query, error = %e, "mysql reply failed");
-                    break;
+                COM_QUERY => {
+                    let query = String::from_utf8_lossy(&pkt[1..]).to_string();
+                    // A schema is the namespace here, so `USE` has to move this connection. Forwarding it
+                    // would report success while the gateway kept qualifying names with the old namespace,
+                    // which reads the wrong schema silently.
+                    if let Some(target) = use_target(&query) {
+                        let switched = switch_namespace(&mut namespace, target, &backend).await;
+                        if switched.is_ok() {
+                            // The held connection belongs to the old schema's pool, and a transaction
+                            // cannot move between backend connections; it is rolled back, not carried.
+                            conn.drop_session(&backend).await;
+                        }
+                        reply_switch(&mut conn, switched).await?;
+                        continue;
+                    }
+                    if let Err(e) = run_statement(&mut conn, &backend, &cfg, &namespace, &query).await {
+                        tracing::debug!(ns = %namespace, query = %query, error = %e, "mysql reply failed");
+                        break;
+                    }
                 }
+                COM_PING => conn.ok(0, 0).await?,
+                _ => conn.err(1047, "Unsupported command").await?,
             }
-            COM_PING => conn.ok(0, 0).await?,
-            _ => conn.err(1047, "Unsupported command").await?,
         }
+        Ok(())
     }
+    .await;
 
-    Ok(())
+    conn.drop_session(&backend).await;
+    ran
 }
 
 /// Points the connection at another namespace. The schema doubles as the namespace, so it has to
@@ -366,12 +399,29 @@ async fn run_statement(
     let requests = vec![StreamRequest::Execute { stmt }];
     let deadline = std::time::Instant::now() + cfg.request_timeout();
     let outcome = backend
-        .run_pipeline(&ns_pool, conn.stream_id, conn.pinned, requests, deadline)
+        .run_pipeline(
+            &ns_pool,
+            conn.stream_id,
+            crate::backend::StreamState {
+                held: conn.held,
+                in_trans: conn.in_trans,
+                session: true,
+            },
+            requests,
+            deadline,
+        )
         .await;
 
-    let crate::backend::Outcome::Done { results, pinned, .. } = outcome else {
-        // Whatever the gateway did with the stream, this connection no longer holds a transaction.
-        conn.pinned = false;
+    let crate::backend::Outcome::Done {
+        results,
+        pinned,
+        in_trans,
+        ..
+    } = outcome
+    else {
+        // Whatever the gateway did with the stream, this connection no longer holds one.
+        conn.held = false;
+        conn.in_trans = false;
         let (code, message) = match outcome {
             crate::backend::Outcome::Deadline => (1205, "Request timeout: the statement was not run".to_owned()),
             crate::backend::Outcome::StreamExpired => (1047, "Stream expired".to_owned()),
@@ -379,7 +429,8 @@ async fn run_statement(
         };
         return conn.err(code, &message).await.map_err(Into::into);
     };
-    conn.pinned = pinned;
+    conn.held = pinned;
+    conn.in_trans = in_trans;
 
     let Some(result) = results.first() else {
         return conn.err(1105, "The statement produced no result").await.map_err(Into::into);

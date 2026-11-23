@@ -2,8 +2,8 @@
 """Checks the MySQL wire protocol server with a hand-written client.
 
 Deliberately uses no driver: what matters here is the framing a driver would hide -- capability
-negotiation, sequence numbers, the DEPRECATE_EOF swap of EOF for OK, packet reassembly past 2^24-1
-bytes and the errno/SQLSTATE a client branches on.
+negotiation, sequence numbers, the framing mysqld uses once CLIENT_DEPRECATE_EOF is on, packet
+reassembly past 2^24-1 bytes in both directions, and the errno/SQLSTATE a client branches on.
 
 Needs xsqld listening with --mysql-listen-addr and a backend reachable from it:
     cargo run -- --mysql-host 127.0.0.1 --mysql-port 3307 --mysql-user root \
@@ -12,13 +12,18 @@ Needs xsqld listening with --mysql-listen-addr and a backend reachable from it:
 """
 
 import os
+import re
 import socket
 import struct
 import sys
+import time
+import urllib.request
 
 HOST = os.environ.get("XS_MYSQL_HOST", "127.0.0.1")
 PORT = int(os.environ.get("XS_MYSQL_PORT", "3308"))
 NAMESPACE = os.environ.get("XS_NAMESPACE", "default")
+# the gateway port is only read for /metrics, which is how a leaked session is detected
+GATEWAY = "http://127.0.0.1:{}".format(os.environ.get("XS_HTTP_PORT", "8090"))
 
 CLIENT_PROTOCOL_41 = 0x00000200
 CLIENT_SECURE_CONNECTION = 0x00008000
@@ -33,6 +38,18 @@ def check(name, ok, detail=""):
     print(f"{'PASS' if ok else 'FAIL'}  {name}{'  -> ' + detail if detail else ''}")
     if not ok:
         failures.append(name)
+
+
+def send_long(sock, message):
+    """Sends a command the way a client does when it exceeds one packet: a full 2^24-1 packet, then
+    the remainder (empty if the message was an exact multiple), sequence advancing per packet."""
+    seq, off = 0, 0
+    while True:
+        chunk = message[off:off + 0xFF_FFFF]
+        send(sock, chunk, seq)
+        seq, off = (seq + 1) & 0xFF, off + len(chunk)
+        if len(chunk) < 0xFF_FFFF:
+            return
 
 
 def send(sock, payload, seq):
@@ -97,6 +114,49 @@ def drain(sock):
             return None
         if payload[0] in (0x00, 0xFE) and len(payload) < 16:
             return payload
+
+
+def pinned_streams():
+    """`xsqld_pinned_streams{ns=...}`: how many backend connections sessions are holding."""
+    try:
+        with urllib.request.urlopen(f"{GATEWAY}/metrics", timeout=10) as r:
+            text = r.read().decode()
+    except OSError:
+        return None
+    m = re.search(r'xsqld_pinned_streams\{ns="%s"\}\s+(-?\d+)' % re.escape(NAMESPACE), text)
+    return int(m.group(1)) if m else None
+
+
+def quit_and_leak_test():
+    """A client that vanishes with a reset must give its backend connection back.
+
+    One session holds one backend connection until it ends, and an idle session is deliberately
+    exempt from the transaction reaper -- so if a hard read error skipped the cleanup, the pool slot
+    would be lost for good and --pool-max connections would kill MySQL access entirely.
+    """
+    held = pinned_streams()
+    if held is None:
+        check("the gateway reports the session's backend connection", False,
+              f"no /metrics on {GATEWAY}; start xsqld with --http-listen-addr on XS_HTTP_PORT")
+        return
+    sock, _ = connect(CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH)
+    query(sock, "SELECT 1 AS one")
+    drain(sock)
+    while pinned_streams() is not None and pinned_streams() < held + 1:
+        time.sleep(0.2)
+    running = pinned_streams()
+    # SO_LINGER with a zero timeout turns the close into an RST: no FIN, no COM_QUIT, just gone
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    sock.close()
+    back = None
+    for _ in range(50):
+        back = pinned_streams()
+        if back is not None and back <= held:
+            break
+        time.sleep(0.2)
+    check("a client that resets instead of quitting releases its backend connection",
+          back is not None and back <= held, f"pinned_streams {running} -> {back} (was {held})")
+    check("the gauge never goes negative", back is not None and back >= 0, str(back))
 
 
 def parse_handshake(hs):
@@ -225,18 +285,20 @@ def main():
     _, ping_seq = read_message(sock)
     check("reply sequence follows the command", ping_seq == 1, str(ping_seq))
 
-    # ---------- DEPRECATE_EOF swaps both EOF packets for OK ----------
+    # ---------- DEPRECATE_EOF: mysqld sends no column terminator at all ----------
+    # Verified against mysql 9.6 CLI / mysqld 8.4.13 on the wire: column count, one definition per
+    # column, then the first row. Only the end of the rows is terminated, and by an EOF packet.
     deof = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH | CLIENT_DEPRECATE_EOF
     sock2, _ = connect(deof)
     payload, _ = query(sock2, "SELECT 1 AS one")
     check("DEPRECATE_EOF keeps the column count", payload == b"\x01", repr(payload))
-    read_message(sock2)  # column definition
-    after_col, _ = read_message(sock2)
-    check("DEPRECATE_EOF replaces the column EOF with OK", after_col[0] == 0x00, repr(after_col[:8]))
+    coldef, _ = read_message(sock2)
     row, _ = read_message(sock2)
-    after_row, _ = read_message(sock2)
-    check("DEPRECATE_EOF replaces the row EOF with OK", after_row[0] == 0x00 and row == b"\x011",
-          f"row={row!r} term={after_row[:6]!r}")
+    check("DEPRECATE_EOF puts the first row right after the column definition",
+          coldef[:4] == b"\x03def" and row == b"\x011", f"coldef={coldef[:6]!r} row={row!r}")
+    term, _ = read_message(sock2)
+    check("the rows still end with an EOF packet, not an OK",
+          term[0] == 0xFE and len(term) < 9, repr(term[:8]))
 
     # ---------- errors carry the backend errno ----------
     payload, _ = query(sock, "SELECT * FROM no_such_table_zz")
@@ -248,7 +310,6 @@ def main():
     # ---------- a value larger than one packet ----------
     payload, _ = query(sock2, "SELECT REPEAT('a', 4000000) AS big")
     read_message(sock2)  # column definition
-    read_message(sock2)  # the OK that replaces the column EOF
     row, _ = read_message(sock2)
     check("a row over 2^24-1 bytes is reassembled", len(row) > 4_000_000, str(len(row)))
     drain(sock2)
@@ -258,6 +319,38 @@ def main():
     payload, _ = read_message(sock2)
     check("COM_INIT_DB refuses an unknown namespace", payload[0] == 0xFF
           and struct.unpack("<H", payload[1:3])[0] == 1049, repr(payload[:20]))
+
+    # ---------- commands that are refused, not silently mishandled ----------
+    send(sock, b"\x16" + b"SELECT 1", 0)  # COM_STMT_PREPARE
+    payload, _ = read_message(sock)
+    check("COM_STMT_PREPARE gets ER_UNSUPPORTED_PS instead of hanging",
+          payload[0] == 0xFF and struct.unpack("<H", payload[1:3])[0] == 1047, repr(payload[:12]))
+    payload, _ = query(sock, "SELECT 1; SELECT 2")
+    check("client-side multi-statement is refused by the backend",
+          payload[0] == 0xFF and struct.unpack("<H", payload[1:3])[0] == 1064,
+          repr(payload[:20]))
+
+    # ---------- a command larger than one packet, coming in ----------
+    # 2^24-1 bytes of SQL is the largest a client can put in a single packet, and exactly one packet
+    # of room for the backend: anything bigger has to be reassembled before it can run.
+    sql = ("SELECT 7 AS seven /* " + "x" * (0xFF_FFFF - 24) + " */").encode()
+    assert len(sql) == 0xFF_FFFF, len(sql)
+    send_long(sock, b"\x03" + sql)
+    payload, _ = read_message(sock)
+    if payload and payload[0] == 0xFF:
+        check("the reassembled multi-packet query reached the backend whole", False,
+              "backend refused it: " + repr(payload[3:60]))
+    else:
+        check("a multi-packet COM_QUERY is reassembled", payload == b"\x01", repr(payload))
+        read_message(sock)  # column definition
+        read_message(sock)  # EOF
+        row, _ = read_message(sock)
+        check("and the tail of it still ran", row == b"\x017", repr(row))
+        term, _ = read_message(sock)
+        check("ending normally", term[0] == 0xFE, repr(term[:6]))
+
+    # ---------- a session that disappears without quitting ----------
+    quit_and_leak_test()
 
     send(sock, b"\x01", 0)
     send(sock2, b"\x01", 0)
