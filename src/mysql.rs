@@ -191,7 +191,7 @@ async fn handle_query(
 async fn try_duckdb(
     conn: &mut MysqlConnection,
     backend: &Arc<Backend>,
-    _query: &str,
+    query: &str,
 ) -> Result<()> {
     // Get namespace and check if mirror is available
     let ns = "default";
@@ -207,9 +207,90 @@ async fn try_duckdb(
         .clone()
         .context("mirror not available")?;
 
-    // For now, return error to trigger fallback to SeekDB
-    // TODO: Execute query on DuckDB via mirror
-    bail!("DuckDB routing not yet implemented")
+    // Try to prepare and execute the query on DuckDB
+    let duck = mirror_view.duck.lock();
+    let mut stmt = match duck.prepare(query) {
+        Ok(s) => s,
+        Err(e) => {
+            drop(duck);
+            bail!("DuckDB prepare failed: {}", e);
+        }
+    };
+
+    let mut rows = match stmt.query([]) {
+        Ok(r) => r,
+        Err(e) => {
+            drop(duck);
+            bail!("DuckDB query failed: {}", e);
+        }
+    };
+
+    // Get column names
+    let col_names: Vec<String> = rows
+        .as_ref()
+        .map(|s| s.column_names())
+        .unwrap_or_default();
+
+    // Send column count
+    let mut col_count_pkt = Vec::new();
+    encode_lenenc_int(&mut col_count_pkt, col_names.len() as u64);
+    conn.write_packet(&col_count_pkt).await?;
+
+    // Send column definitions
+    for col_name in &col_names {
+        let mut col_pkt = Vec::new();
+        encode_lenenc_str(&mut col_pkt, b"def");
+        encode_lenenc_str(&mut col_pkt, b"");
+        encode_lenenc_str(&mut col_pkt, b"");
+        encode_lenenc_str(&mut col_pkt, b"");
+        encode_lenenc_str(&mut col_pkt, col_name.as_bytes());
+        encode_lenenc_str(&mut col_pkt, col_name.as_bytes());
+        col_pkt.put_u8(0x0c);
+        col_pkt.put_u24_le(63);
+        col_pkt.put_u32_le(1024);
+        col_pkt.put_u8(0xfd);
+        col_pkt.put_u16_le(0);
+        col_pkt.put_u8(0);
+        col_pkt.put_u16_le(0);
+        conn.write_packet(&col_pkt).await?;
+    }
+
+    // Send EOF after columns
+    send_eof(conn).await?;
+
+    // Send rows
+    let mut row_count = 0u64;
+    while let Some(row_result) = rows.next() {
+        match row_result {
+            Ok(_row) => {
+                // Convert DuckDB row to MySQL row format
+                let mut pkt = Vec::new();
+                for i in 0..col_names.len() {
+                    if let Ok(val) = _row.get::<String>(i) {
+                        encode_lenenc_str(&mut pkt, val.as_bytes());
+                    } else {
+                        pkt.put_u8(0xfb); // NULL
+                    }
+                }
+                conn.write_packet(&pkt).await?;
+                row_count += 1;
+            }
+            Err(e) => {
+                drop(rows);
+                drop(duck);
+                bail!("Error reading DuckDB row: {}", e);
+            }
+        }
+    }
+
+    drop(rows);
+    drop(duck);
+
+    // Send EOF after rows
+    send_eof(conn).await?;
+
+    tracing::debug!(row_count = row_count, "DuckDB query executed");
+    Ok(())
 }
 
 async fn execute_on_seekdb(
